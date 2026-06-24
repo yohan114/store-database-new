@@ -1177,25 +1177,25 @@ app.get('/api/inventory', (req, res) => {
 
         // Get total count matching filters
         const countRow = dbApi.get(`
-            \${cte}
+            ${cte}
             SELECT COUNT(*) AS c FROM inventory_base
-            \${whereSql}
+            ${whereSql}
         `, params);
         const total = countRow.c;
 
         // Get paginated and sorted items
         const skip = (page - 1) * limit;
         const items = dbApi.all(`
-            \${cte}
+            ${cte}
             SELECT * FROM inventory_base
-            \${whereSql}
-            ORDER BY \${sortCol} \${order}
+            ${whereSql}
+            ORDER BY ${sortCol} ${order}
             LIMIT ? OFFSET ?
         `, [...params, limit, skip]);
 
         // Get dynamic KPIs over the entire list
         const kpis = dbApi.get(`
-            \${cte}
+            ${cte}
             SELECT 
                 COUNT(*) AS totalSKUs,
                 SUM(CASE WHEN status = 'instock' THEN 1 ELSE 0 END) AS inStock,
@@ -1207,7 +1207,7 @@ app.get('/api/inventory', (req, res) => {
 
         // Compute dynamic counts per category for the chips (over the entire base list)
         const categoryCounts = dbApi.all(`
-            \${cte}
+            ${cte}
             SELECT category, COUNT(*) AS count
             FROM inventory_base
             GROUP BY category
