@@ -31,8 +31,20 @@ app.use('/api', (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     next();
 });
+// Serve the new React app (Phase 0 rebuild) from its production build at /app.
+// Legacy item_tracker.html stays the default at "/", untouched, so nothing
+// breaks while screens are ported. SPA fallback returns index.html for any
+// client-side route under /app that is not a real built asset.
+const CLIENT_DIST = path.join(__dirname, 'client', 'dist');
+if (fs.existsSync(CLIENT_DIST)) {
+    app.use('/app', express.static(CLIENT_DIST));
+    app.get('/app', (req, res) => res.sendFile(path.join(CLIENT_DIST, 'index.html')));
+    app.get('/app/*', (req, res) => res.sendFile(path.join(CLIENT_DIST, 'index.html')));
+}
+
 app.use(express.static(__dirname));
 app.get('/', (req, res) => res.redirect('/item_tracker.html'));
+app.get('/legacy', (req, res) => res.redirect('/item_tracker.html'));
 
 // --- helpers ----------------------------------------------------------------
 const s = (v) => (v === null || v === undefined) ? '' : String(v);

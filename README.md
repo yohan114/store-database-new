@@ -16,6 +16,23 @@ dataset (~2,950 items): full list **~13 ms**, a single page **<1 ms**, vehicle +
 
 > Your original `inventory.accdb` is left untouched as a backup and is used as the migration source.
 
+## New interface rebuild (in progress)
+
+The interface is being rebuilt as a modern **React + Vite** app under `client/`, replacing the single
+7,900-line `item_tracker.html`. Tailwind is now compiled locally (no slow CDN) and the screens load from a
+small bundled build.
+
+- The new app is served at **`/app`** (e.g. `http://localhost:5000/app`).
+- The existing screen stays the default at **`/`** (also reachable at `/legacy`) and is **unchanged** —
+  screens are ported one at a time, and each new screen links back to the legacy view until it is complete.
+- Build the new app with `npm run build` (installs client deps + builds to `client/dist`). The Node server
+  automatically serves that build when it exists.
+- For UI development with hot-reload, run the API (`npm start`) and, in another terminal, `npm run client:dev`
+  (Vite dev server on :5173, proxying `/api` to the backend).
+
+Planned phases: foundation → accounts/roles/audit → port all screens → low-stock alerts & reorder →
+barcode/QR scanning → reports & printable slips → LAN multi-user deployment.
+
 ## Setup
 
 ```bash
