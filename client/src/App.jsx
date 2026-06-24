@@ -7,6 +7,8 @@ import Receiving from './features/receiving/Receiving.jsx';
 import Pricing from './features/pricing/Pricing.jsx';
 import Issued from './features/issued/Issued.jsx';
 import Inventory from './features/inventory/Inventory.jsx';
+import Fleet from './features/fleet/Fleet.jsx';
+import Batteries from './features/batteries/Batteries.jsx';
 import Admin from './features/admin/Admin.jsx';
 import Login from './features/auth/Login.jsx';
 import { useAuth } from './auth/AuthContext.jsx';
@@ -22,6 +24,8 @@ function ported(user) {
     '/pricing': <Pricing />,
     '/issued': <Issued />,
     '/inventory': <Inventory />,
+    '/fleet': <Fleet />,
+    '/batteries': <Batteries />,
     '/admin': user?.role === 'admin' ? <Admin /> : <Placeholder title="Admins only" legacyHint="Ask an administrator for access." />,
   };
 }
