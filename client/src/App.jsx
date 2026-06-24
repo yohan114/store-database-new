@@ -4,6 +4,7 @@ import Placeholder from './components/Placeholder.jsx';
 import Dashboard from './features/dashboard/Dashboard.jsx';
 import Tracker from './features/tracker/Tracker.jsx';
 import Receiving from './features/receiving/Receiving.jsx';
+import Pricing from './features/pricing/Pricing.jsx';
 import Admin from './features/admin/Admin.jsx';
 import Login from './features/auth/Login.jsx';
 import { useAuth } from './auth/AuthContext.jsx';
@@ -16,6 +17,7 @@ function ported(user) {
     '/': <Dashboard />,
     '/tracker': <Tracker />,
     '/receiving': <Receiving />,
+    '/pricing': <Pricing />,
     '/admin': user?.role === 'admin' ? <Admin /> : <Placeholder title="Admins only" legacyHint="Ask an administrator for access." />,
   };
 }
