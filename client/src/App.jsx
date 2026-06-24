@@ -2,6 +2,7 @@ import { Routes, Route } from 'react-router-dom';
 import Layout from './components/Layout.jsx';
 import Placeholder from './components/Placeholder.jsx';
 import Dashboard from './features/dashboard/Dashboard.jsx';
+import Tracker from './features/tracker/Tracker.jsx';
 import Admin from './features/admin/Admin.jsx';
 import Login from './features/auth/Login.jsx';
 import { useAuth } from './auth/AuthContext.jsx';
@@ -12,6 +13,7 @@ import { ALL_NAV_ITEMS } from './nav.js';
 function ported(user) {
   return {
     '/': <Dashboard />,
+    '/tracker': <Tracker />,
     '/admin': user?.role === 'admin' ? <Admin /> : <Placeholder title="Admins only" legacyHint="Ask an administrator for access." />,
   };
 }

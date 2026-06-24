@@ -23,9 +23,16 @@ echo Preparing database...
 node migrate_to_sqlite.js
 echo.
 
+REM Build the new web interface (compiles the React app into client\dist).
+REM Safe to run every time; takes a few seconds.
+echo Building app interface...
+call npm run build
+echo.
+
 echo Starting server...
 start "Inventory Monitor Backend" cmd /k "node server.js"
 echo.
 echo Server started. Keep the new window open while using the app.
-echo Open the app at: http://localhost:5000/item_tracker.html
+echo   New interface (with login): http://localhost:5000/app
+echo   Legacy interface:           http://localhost:5000/item_tracker.html
 pause
