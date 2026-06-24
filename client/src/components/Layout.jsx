@@ -1,5 +1,12 @@
 import { NavLink } from 'react-router-dom';
 import { NAV_SECTIONS } from '../nav.js';
+import { useAuth } from '../auth/AuthContext.jsx';
+
+const ROLE_BADGE = {
+  admin: 'bg-brand-100 text-brand-700',
+  storekeeper: 'bg-emerald-100 text-emerald-700',
+  viewer: 'bg-slate-200 text-slate-600',
+};
 
 function SidebarLink({ item }) {
   return (
@@ -27,6 +34,14 @@ function SidebarLink({ item }) {
 }
 
 export default function Layout({ children }) {
+  const { user, logout } = useAuth();
+
+  // Hide admin-only items from non-admins; drop any section left empty.
+  const sections = NAV_SECTIONS.map((s) => ({
+    ...s,
+    items: s.items.filter((i) => i.key !== 'admin' || user?.role === 'admin'),
+  })).filter((s) => s.items.length > 0);
+
   return (
     <div className="flex h-full">
       {/* Sidebar */}
@@ -39,7 +54,7 @@ export default function Layout({ children }) {
           </div>
         </div>
         <nav className="flex-1 space-y-5 overflow-y-auto px-3 py-4">
-          {NAV_SECTIONS.map((section) => (
+          {sections.map((section) => (
             <div key={section.title}>
               <div className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wider text-brand-100/50">
                 {section.title}
@@ -65,10 +80,26 @@ export default function Layout({ children }) {
           <div className="text-sm text-slate-500">
             Workshop MRN · Receiving · Issuing · Stock
           </div>
-          <div className="flex items-center gap-3">
-            <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700">
+          <div className="flex items-center gap-4">
+            <span className="hidden rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700 sm:inline">
               ● Live
             </span>
+            {user && (
+              <div className="flex items-center gap-3">
+                <div className="text-right leading-tight">
+                  <div className="text-sm font-medium text-slate-700">{user.fullName || user.username}</div>
+                  <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${ROLE_BADGE[user.role] || ''}`}>
+                    {user.role}
+                  </span>
+                </div>
+                <button
+                  onClick={logout}
+                  className="rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50"
+                >
+                  Log out
+                </button>
+              </div>
+            )}
           </div>
         </header>
         <main className="flex-1 overflow-y-auto p-6">{children}</main>

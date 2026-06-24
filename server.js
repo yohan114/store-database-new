@@ -18,8 +18,10 @@ const { PDFParse } = require('pdf-parse');
 const dbApi = require('./db');
 const { toISO, nowISO } = dbApi;
 const { classify, CATEGORIES } = require('./categorize');
+const auth = require('./auth');
 
 dbApi.init();
+auth.ensureSchema();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -31,6 +33,13 @@ app.use('/api', (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     next();
 });
+
+// Accounts / roles / audit (Phase 1): attach the logged-in user to every API
+// request, audit successful mutations, then mount the auth + admin routes.
+app.use(auth.attachUser);
+app.use(auth.auditMiddleware);
+auth.registerRoutes(app);
+
 // Serve the new React app (Phase 0 rebuild) from its production build at /app.
 // Legacy item_tracker.html stays the default at "/", untouched, so nothing
 // breaks while screens are ported. SPA fallback returns index.html for any
@@ -187,14 +196,9 @@ app.put('/api/items/:id', (req, res) => {
     }
 });
 
-// Middleware to verify deletion password
-const verifyDeletePassword = (req, res, next) => {
-    const password = req.headers['x-delete-password'] || req.query.password;
-    if (password !== 'E&CWorkshop') {
-        return res.status(403).json({ error: 'Unauthorized: Incorrect delete password.' });
-    }
-    next();
-};
+// Delete authorization now flows through the auth module: a logged-in
+// Storekeeper/Admin token, or (during migration) the legacy shared password.
+const verifyDeletePassword = auth.requireDelete;
 
 // 4. DELETE /api/items/:id  (cascades receipts)
 app.delete('/api/items/:id', verifyDeletePassword, (req, res) => {

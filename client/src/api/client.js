@@ -21,6 +21,11 @@ async function request(path, { method = 'GET', body, headers = {} } = {}) {
   const res = await fetch(`/api${path}`, opts);
 
   if (!res.ok) {
+    // A 401 on a request we thought was authenticated means the session
+    // expired or was revoked — let the app log the user out cleanly.
+    if (res.status === 401 && token && path !== '/auth/login') {
+      window.dispatchEvent(new CustomEvent('auth:unauthorized'));
+    }
     let message = `Request failed (${res.status})`;
     try {
       const data = await res.json();

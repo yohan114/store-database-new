@@ -30,7 +30,26 @@ small bundled build.
 - For UI development with hot-reload, run the API (`npm start`) and, in another terminal, `npm run client:dev`
   (Vite dev server on :5173, proxying `/api` to the backend).
 
-Planned phases: foundation → accounts/roles/audit → port all screens → low-stock alerts & reorder →
+### Accounts, roles & audit log
+
+The new app requires sign-in. On first run a default admin is created:
+
+```
+username: admin    password: admin123
+```
+
+**Log in at `/app` and change this password immediately** (Users & Audit → Reset password). You can override the
+seed with `ADMIN_DEFAULT_USER` / `ADMIN_DEFAULT_PASSWORD` env vars.
+
+- **Roles:** `admin` (full access + user management), `storekeeper` (add/edit/delete stock data),
+  `viewer` (read-only).
+- **Audit log:** every successful change (and every login) is recorded with who/what/when — see
+  Users & Audit → Audit Log (admin only).
+- **Sessions** are server-side bearer tokens (revocable; default 7-day expiry, set `SESSION_TTL_DAYS`).
+- **Legacy delete password:** the old shared `x-delete-password` still works as a fallback so `item_tracker.html`
+  keeps functioning during migration. Disable it once the legacy UI is retired with `LEGACY_DELETE_PASSWORD=""`.
+
+Planned phases: ✅ foundation → ✅ accounts/roles/audit → port all screens → low-stock alerts & reorder →
 barcode/QR scanning → reports & printable slips → LAN multi-user deployment.
 
 ## Setup

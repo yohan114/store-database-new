@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import App from './App.jsx';
+import { AuthProvider } from './auth/AuthContext.jsx';
 import './index.css';
 
 // One shared query client. Sensible defaults for a LAN app: cache for 30s,
@@ -23,7 +24,9 @@ ReactDOM.createRoot(document.getElementById('root')).render(
     <QueryClientProvider client={queryClient}>
       {/* basename keeps client routes under /app to match how Express serves the build */}
       <BrowserRouter basename="/app">
-        <App />
+        <AuthProvider>
+          <App />
+        </AuthProvider>
       </BrowserRouter>
     </QueryClientProvider>
   </React.StrictMode>,
