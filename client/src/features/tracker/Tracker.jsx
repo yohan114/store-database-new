@@ -238,6 +238,12 @@ function FragmentRow({ it, isOpen, label, cls, onToggle, canWrite, canDelete, on
         <tr className="bg-slate-50/60">
           <td></td>
           <td colSpan={9} className="px-3 py-3">
+            <div className="mb-3 flex flex-wrap gap-x-6 gap-y-1 text-xs">
+              <span className="text-slate-500">Requested <span className="font-semibold text-slate-700">{num(it.reqQty)}</span></span>
+              <span className="text-slate-500">Received <span className="font-semibold text-emerald-700">{num(it.recQty)}</span></span>
+              <span className="text-slate-500">Issued <span className="font-semibold text-rose-700">{num(it.issuedQty || 0)}</span></span>
+              <span className="text-slate-500">In stock <span className="font-semibold text-slate-800">{num((it.recQty || 0) - (it.issuedQty || 0))}</span></span>
+            </div>
             <ReceiptsPanel receipts={it.receipts || []} />
           </td>
         </tr>

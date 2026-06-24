@@ -141,6 +141,7 @@ function init() {
 
         CREATE TABLE IF NOT EXISTS issues (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            itemId INTEGER,
             issueDate TEXT,
             issueDateISO TEXT,
             vehicleMachinery TEXT,
@@ -292,6 +293,62 @@ function init() {
             exec(`CREATE INDEX IF NOT EXISTS idx_items_category ON items(category);`);
         }
     } catch (e) { /* fresh DB already has it */ }
+
+    // Link issues to the MRN line they draw from (requested -> received -> issued).
+    // Add issues.itemId on older DBs, then one-time backfill of historical issues by
+    // matching (mrnNum, itemName) first, then (vehicleMachinery, itemName). Unmatched
+    // rows stay NULL (legacy) and are never re-touched, so manual issues are preserved.
+    try {
+        const cols = all(`PRAGMA table_info(issues)`);
+        if (!cols.some(c => c.name === 'itemId')) {
+            exec(`ALTER TABLE issues ADD COLUMN itemId INTEGER;`);
+
+            exec(`
+                UPDATE issues
+                SET itemId = (
+                    SELECT i.id FROM items i
+                    WHERE i.mrnNum = issues.mrnNum
+                      AND LOWER(TRIM(i.itemName)) = LOWER(TRIM(issues.itemName))
+                    ORDER BY (SELECT COUNT(*) FROM receipts r WHERE r.itemId = i.id) DESC, i.id ASC
+                    LIMIT 1
+                )
+                WHERE itemId IS NULL
+                  AND mrnNum IS NOT NULL AND TRIM(mrnNum) != ''
+                  AND TRIM(COALESCE(itemName,'')) != ''
+                  AND EXISTS (
+                    SELECT 1 FROM items i2
+                    WHERE i2.mrnNum = issues.mrnNum
+                      AND LOWER(TRIM(i2.itemName)) = LOWER(TRIM(issues.itemName))
+                  );
+            `);
+
+            exec(`
+                UPDATE issues
+                SET itemId = (
+                    SELECT i.id FROM items i
+                    WHERE LOWER(TRIM(i.vehicleMachinery)) = LOWER(TRIM(issues.vehicleMachinery))
+                      AND LOWER(TRIM(i.itemName)) = LOWER(TRIM(issues.itemName))
+                    ORDER BY (SELECT COUNT(*) FROM receipts r WHERE r.itemId = i.id) DESC, i.id ASC
+                    LIMIT 1
+                )
+                WHERE itemId IS NULL
+                  AND TRIM(COALESCE(vehicleMachinery,'')) != ''
+                  AND TRIM(COALESCE(itemName,'')) != ''
+                  AND EXISTS (
+                    SELECT 1 FROM items i2
+                    WHERE LOWER(TRIM(i2.vehicleMachinery)) = LOWER(TRIM(issues.vehicleMachinery))
+                      AND LOWER(TRIM(i2.itemName)) = LOWER(TRIM(issues.itemName))
+                  );
+            `);
+
+            const linked = get(`SELECT COUNT(*) AS c FROM issues WHERE itemId IS NOT NULL`).c;
+            const total = get(`SELECT COUNT(*) AS c FROM issues`).c;
+            console.log(`[migrate] issues.itemId added; linked ${linked}/${total} historical issues to MRN lines.`);
+        }
+        // Ensure the index exists on both fresh and migrated databases.
+        exec(`CREATE INDEX IF NOT EXISTS idx_issues_itemId ON issues(itemId);`);
+    } catch (e) { console.warn('issues.itemId migration warning:', e.message); }
+
     return db;
 }
 

@@ -124,6 +124,7 @@ app.get('/api/items', (req, res) => {
             COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId=i.id),0) AS recQty,
             (SELECT COUNT(*) FROM receipts r WHERE r.itemId=i.id) AS recCount,
             (SELECT MAX(deliveryDateISO) FROM receipts r WHERE r.itemId=i.id) AS recDateISO,
+            COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.itemId=i.id),0) AS issuedQty,
             CASE WHEN EXISTS(SELECT 1 FROM receipts r WHERE r.itemId=i.id AND (r.unitPrice IS NULL OR r.unitPrice=0)) THEN 1 ELSE 0 END AS hasUnpriced
         `;
 
@@ -275,6 +276,90 @@ app.delete('/api/receipts/:id', verifyDeletePassword, (req, res) => {
 });
 
 // ===========================================================================
+// Issue-stock availability (requested -> received -> issued).
+// "Issued so far" is summed per item line via issues.itemId, so editing or
+// deleting an issue automatically returns stock — availability is computed,
+// never stored. A small epsilon avoids floating-point false negatives.
+// ===========================================================================
+const EPS = 1e-9;
+function lineReceived(itemId) {
+    return dbApi.get(`SELECT COALESCE(SUM(qty),0) AS q FROM receipts WHERE itemId=?`, [itemId]).q;
+}
+function lineIssued(itemId, excludeIssueId = null) {
+    return excludeIssueId
+        ? dbApi.get(`SELECT COALESCE(SUM(qty),0) AS q FROM issues WHERE itemId=? AND id<>?`, [itemId, excludeIssueId]).q
+        : dbApi.get(`SELECT COALESCE(SUM(qty),0) AS q FROM issues WHERE itemId=?`, [itemId]).q;
+}
+function lineAvailable(itemId, excludeIssueId = null) {
+    return lineReceived(itemId) - lineIssued(itemId, excludeIssueId);
+}
+// Pooled availability for an item name: received under that name minus everything
+// issued against it (linked issues use their item's name; legacy/manual use their own).
+function nameAvailable(cleanName) {
+    const recv = dbApi.get(
+        `SELECT COALESCE(SUM(r.qty),0) AS q FROM receipts r JOIN items i ON i.id=r.itemId
+         WHERE LOWER(TRIM(i.itemName)) = ?`, [cleanName]).q;
+    const iss = dbApi.get(
+        `SELECT COALESCE(SUM(iss.qty),0) AS q FROM issues iss LEFT JOIN items i ON i.id=iss.itemId
+         WHERE LOWER(TRIM(COALESCE(i.itemName, iss.itemName))) = ?`, [cleanName]).q;
+    return recv - iss;
+}
+
+// GET /api/issuable-stock?mode=line|name&search= — what can currently be issued.
+app.get('/api/issuable-stock', (req, res) => {
+    try {
+        const mode = req.query.mode === 'name' ? 'name' : 'line';
+        const search = req.query.search ? `%${req.query.search}%` : null;
+
+        if (mode === 'line') {
+            const where = [
+                `COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId=i.id),0) >
+                 COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.itemId=i.id),0) + ${EPS}`,
+            ];
+            const params = [];
+            if (search) { where.push(`(i.itemName LIKE ? OR i.itemDesc LIKE ? OR i.vehicleMachinery LIKE ? OR i.mrnNum LIKE ?)`); params.push(search, search, search, search); }
+            const rows = dbApi.all(`
+                SELECT i.id AS itemId, i.itemName, i.itemDesc, i.category, i.vehicleMachinery, i.mrnNum,
+                  ROUND(COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId=i.id),0),2) AS recQty,
+                  ROUND(COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.itemId=i.id),0),2) AS issuedQty
+                FROM items i
+                WHERE ${where.join(' AND ')}
+                ORDER BY i.itemName COLLATE NOCASE ASC
+                LIMIT 200
+            `, params);
+            rows.forEach(r => { r.available = Math.round((r.recQty - r.issuedQty) * 100) / 100; });
+            return res.json(rows);
+        }
+
+        // Pooled-by-name mode
+        const rows = dbApi.all(`
+            WITH received AS (
+                SELECT LOWER(TRIM(i.itemName)) AS cleanName, MAX(i.itemName) AS itemName, MAX(i.category) AS category, SUM(r.qty) AS totalReceived
+                FROM items i JOIN receipts r ON r.itemId=i.id
+                ${search ? 'WHERE i.itemName LIKE ?' : ''}
+                GROUP BY LOWER(TRIM(i.itemName))
+            ),
+            issued AS (
+                SELECT LOWER(TRIM(COALESCE(i.itemName, iss.itemName))) AS cleanName, SUM(iss.qty) AS totalIssued
+                FROM issues iss LEFT JOIN items i ON i.id=iss.itemId
+                GROUP BY LOWER(TRIM(COALESCE(i.itemName, iss.itemName)))
+            )
+            SELECT rc.cleanName, rc.itemName, rc.category,
+                   ROUND(rc.totalReceived,2) AS totalReceived,
+                   ROUND(COALESCE(iss.totalIssued,0),2) AS totalIssued,
+                   ROUND(rc.totalReceived - COALESCE(iss.totalIssued,0),2) AS available
+            FROM received rc LEFT JOIN issued iss ON iss.cleanName = rc.cleanName
+            WHERE rc.totalReceived - COALESCE(iss.totalIssued,0) > ${EPS}
+            ORDER BY rc.itemName COLLATE NOCASE ASC
+            LIMIT 200
+        `, search ? [search] : []);
+        return res.json(rows);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ===========================================================================
 // 8. ISSUES — update issue (items issued out to a vehicle/machinery)
 // ===========================================================================
 app.get('/api/issues', (req, res) => {
@@ -305,20 +390,87 @@ app.get('/api/issues', (req, res) => {
     }
 });
 
+// Issue items out. An item must have been received first; you cannot issue more
+// than is available. Three paths: a specific received line (itemId), pooled stock
+// by item name (FIFO across that name's lines), or an admin-only manual/unlinked
+// correction. Every created issue carries itemId except manual ones.
 app.post('/api/issues', (req, res) => {
     try {
         const b = req.body || {};
-        const itemName = s(b.itemName);
-        const itemDesc = s(b.itemDesc);
-        const category = b.category && String(b.category).trim() ? String(b.category).trim() : classify(itemName, itemDesc);
+        const qty = Number(b.qty) || 0;
+        if (qty <= 0) return res.status(400).json({ error: 'Quantity must be greater than zero.' });
         const now = nowISO();
-        const r = dbApi.run(
-            `INSERT INTO issues (issueDate, issueDateISO, vehicleMachinery, itemName, itemDesc, qty, category, issuedTo, issuedBy, mrnNum, purchaseSource, notes, createdAt, updatedAt)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [s(b.issueDate), toISO(b.issueDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.qty) || 0, category,
-             s(b.issuedTo), s(b.issuedBy), s(b.mrnNum), s(b.purchaseSource), s(b.notes), now, now]
-        );
-        res.json({ success: true, id: r.lastInsertRowid, category });
+        const issueDate = s(b.issueDate);
+        const issueDateISO = toISO(b.issueDate);
+
+        // Insert one issue row drawing q units from `line` (or unlinked when line is null).
+        const insertIssue = (line, q) => {
+            const itemName = line ? line.itemName : s(b.itemName);
+            const itemDesc = line ? (line.itemDesc || s(b.itemDesc)) : s(b.itemDesc);
+            const category = (line && line.category) ? line.category
+                : (b.category && String(b.category).trim() ? String(b.category).trim() : classify(itemName, itemDesc));
+            const mrnNum = s(b.mrnNum) || (line ? line.mrnNum : '');
+            const vehicle = s(b.vehicleMachinery) || (line ? line.vehicleMachinery : '');
+            return dbApi.run(
+                `INSERT INTO issues (itemId, issueDate, issueDateISO, vehicleMachinery, itemName, itemDesc, qty, category, issuedTo, issuedBy, mrnNum, purchaseSource, notes, createdAt, updatedAt)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [line ? line.id : null, issueDate, issueDateISO, vehicle, itemName, itemDesc, q, category,
+                 s(b.issuedTo), s(b.issuedBy), mrnNum, s(b.purchaseSource), s(b.notes), now, now]
+            ).lastInsertRowid;
+        };
+
+        // (1) Admin manual override — unlinked issue, no stock check (corrections).
+        if (b.manual === true) {
+            if (!req.user || req.user.role !== 'admin') return res.status(403).json({ error: 'Manual (unlinked) issues require an admin.' });
+            if (!s(b.itemName)) return res.status(400).json({ error: 'Item name is required.' });
+            return res.json({ success: true, ids: [insertIssue(null, qty)], manual: true });
+        }
+
+        // (2) Line mode — issue against one received MRN line.
+        if (b.itemId) {
+            const line = dbApi.get(`SELECT * FROM items WHERE id=?`, [parseInt(b.itemId)]);
+            if (!line) return res.status(404).json({ error: 'Item line not found.' });
+            const avail = lineAvailable(line.id);
+            if (avail <= EPS) return res.status(400).json({ error: 'That line has no stock available to issue.' });
+            if (qty > avail + EPS) return res.status(400).json({ error: `Only ${avail} available to issue from this line (requested ${qty}).` });
+            return res.json({ success: true, ids: [insertIssue(line, qty)], itemId: line.id });
+        }
+
+        // (3) Pooled-by-name mode — FIFO across the item's received lines. Any
+        // name-bearing issue without an itemId flows here (incl. the legacy UI), so
+        // the receive-first rule is enforced uniformly.
+        if (b.cleanName || b.itemName) {
+            const cleanName = String(b.cleanName || b.itemName).trim().toLowerCase();
+            const avail = nameAvailable(cleanName);
+            if (qty > avail + EPS) return res.status(400).json({ error: `Only ${avail} available in stock for this item (requested ${qty}).` });
+
+            const lines = dbApi.all(`
+                SELECT i.*,
+                  COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId=i.id),0) AS recQty,
+                  COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.itemId=i.id),0) AS issuedQty,
+                  (SELECT MIN(deliveryDateISO) FROM receipts r WHERE r.itemId=i.id) AS firstReceiptISO
+                FROM items i WHERE LOWER(TRIM(i.itemName)) = ?
+            `, [cleanName])
+                .map(l => ({ ...l, lineAvail: l.recQty - l.issuedQty }))
+                .filter(l => l.lineAvail > EPS)
+                .sort((a, c) => String(a.firstReceiptISO || '').localeCompare(String(c.firstReceiptISO || '')) || a.id - c.id);
+
+            const ids = dbApi.transaction(() => {
+                let remaining = qty;
+                const created = [];
+                for (const line of lines) {
+                    if (remaining <= EPS) break;
+                    const take = Math.min(remaining, line.lineAvail);
+                    created.push(insertIssue(line, take));
+                    remaining -= take;
+                }
+                if (remaining > EPS) throw new Error('Insufficient stock across lines.');
+                return created;
+            });
+            return res.json({ success: true, ids });
+        }
+
+        return res.status(400).json({ error: 'Select a received line or an item with available stock to issue.' });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -328,12 +480,24 @@ app.put('/api/issues/:id', (req, res) => {
     try {
         const id = parseInt(req.params.id);
         const b = req.body || {};
+        const existing = dbApi.get(`SELECT * FROM issues WHERE id=?`, [id]);
+        if (!existing) return res.status(404).json({ error: 'Issue not found.' });
+        const qty = Number(b.qty) || 0;
+        if (qty <= 0) return res.status(400).json({ error: 'Quantity must be greater than zero.' });
+
+        // Re-validate against the linked line's availability, excluding this issue's own qty.
+        if (existing.itemId) {
+            const avail = lineAvailable(existing.itemId, id);
+            if (qty > avail + EPS) return res.status(400).json({ error: `Only ${avail} available to issue from this line (requested ${qty}).` });
+        }
+
         const itemName = s(b.itemName);
         const itemDesc = s(b.itemDesc);
         const category = b.category && String(b.category).trim() ? String(b.category).trim() : classify(itemName, itemDesc);
+        // itemId is intentionally left unchanged — the issue stays linked to its source line.
         dbApi.run(
             `UPDATE issues SET issueDate=?, issueDateISO=?, vehicleMachinery=?, itemName=?, itemDesc=?, qty=?, category=?, issuedTo=?, issuedBy=?, mrnNum=?, purchaseSource=?, notes=?, updatedAt=? WHERE id=?`,
-            [s(b.issueDate), toISO(b.issueDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.qty) || 0, category,
+            [s(b.issueDate), toISO(b.issueDate), s(b.vehicleMachinery), itemName, itemDesc, qty, category,
              s(b.issuedTo), s(b.issuedBy), s(b.mrnNum), s(b.purchaseSource), s(b.notes), nowISO(), id]
         );
         res.json({ success: true, category });
@@ -669,13 +833,13 @@ app.get('/api/active-items', (req, res) => {
                     i.reqDate,
                     COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AS recQty,
                     COALESCE((
-                        SELECT SUM(qty) FROM issues iss 
-                        WHERE (
-                            (i.mrnNum IS NOT NULL AND i.mrnNum != '' AND iss.mrnNum = i.mrnNum)
-                            OR 
-                            ((i.mrnNum IS NULL OR i.mrnNum = '') AND i.vehicleMachinery IS NOT NULL AND i.vehicleMachinery != '' AND iss.vehicleMachinery = i.vehicleMachinery)
-                        )
-                        AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName))
+                        SELECT SUM(qty) FROM issues iss
+                        WHERE iss.itemId = i.id
+                           OR (iss.itemId IS NULL AND (
+                                (i.mrnNum IS NOT NULL AND i.mrnNum != '' AND iss.mrnNum = i.mrnNum)
+                                OR
+                                ((i.mrnNum IS NULL OR i.mrnNum = '') AND i.vehicleMachinery IS NOT NULL AND i.vehicleMachinery != '' AND iss.vehicleMachinery = i.vehicleMachinery)
+                              ) AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName)))
                     ), 0) AS issuedQty
                 FROM items i
             )
@@ -702,9 +866,9 @@ app.get('/api/fleet', (req, res) => {
                     TRIM(i.vehicleMachinery) AS vehicle,
                     i.reqQty,
                     COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AS recQty,
-                    COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.mrnNum = i.mrnNum AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName))), 0) AS issuedQty,
+                    COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.itemId = i.id OR (iss.itemId IS NULL AND iss.mrnNum = i.mrnNum AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName)))), 0) AS issuedQty,
                     CASE WHEN i.reqQty > COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) THEN 1 ELSE 0 END AS is_pending_supplier,
-                    CASE WHEN COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) > COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.mrnNum = i.mrnNum AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName))), 0) THEN 1 ELSE 0 END AS is_pending_workshop,
+                    CASE WHEN COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) > COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.itemId = i.id OR (iss.itemId IS NULL AND iss.mrnNum = i.mrnNum AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName)))), 0) THEN 1 ELSE 0 END AS is_pending_workshop,
                     CASE WHEN i.reqQty > COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AND TRIM(COALESCE(i.reqDateISO, '')) != '' AND i.reqDateISO < DATE('now', 'localtime') THEN 1 ELSE 0 END AS is_overdue,
                     1 AS item_line
                 FROM items i
@@ -843,10 +1007,11 @@ app.get('/api/sidebar-stats', (req, res) => {
                 GROUP BY LOWER(TRIM(i.itemName))
             ),
             issued_totals AS (
-                SELECT LOWER(TRIM(itemName)) AS cleanName, SUM(qty) AS totalIssued
-                FROM issues
-                WHERE qty > 0
-                GROUP BY LOWER(TRIM(itemName))
+                SELECT LOWER(TRIM(COALESCE(it.itemName, iss.itemName))) AS cleanName, SUM(iss.qty) AS totalIssued
+                FROM issues iss
+                LEFT JOIN items it ON it.id = iss.itemId
+                WHERE iss.qty > 0
+                GROUP BY LOWER(TRIM(COALESCE(it.itemName, iss.itemName)))
             ),
             all_names AS (
                 SELECT cleanName FROM received_totals
@@ -1145,10 +1310,14 @@ app.get('/api/inventory', (req, res) => {
                 GROUP BY LOWER(TRIM(i.itemName))
             ),
             issued_totals AS (
-                SELECT LOWER(TRIM(itemName)) AS cleanName, MAX(itemName) AS itemName, MAX(category) AS category, SUM(qty) AS totalIssued
-                FROM issues
-                WHERE qty > 0
-                GROUP BY LOWER(TRIM(itemName))
+                SELECT LOWER(TRIM(COALESCE(it.itemName, iss.itemName))) AS cleanName,
+                       MAX(COALESCE(it.itemName, iss.itemName)) AS itemName,
+                       MAX(COALESCE(it.category, iss.category)) AS category,
+                       SUM(iss.qty) AS totalIssued
+                FROM issues iss
+                LEFT JOIN items it ON it.id = iss.itemId
+                WHERE iss.qty > 0
+                GROUP BY LOWER(TRIM(COALESCE(it.itemName, iss.itemName)))
             ),
             all_names AS (
                 SELECT cleanName, itemName, category FROM received_totals
@@ -1255,19 +1424,20 @@ app.get('/api/inventory/details', (req, res) => {
             ORDER BY r.deliveryDateISO DESC, r.id DESC
         `, [cleanName]);
 
-        // Get issues
+        // Get issues (linked by itemId where present, else by legacy name match)
         const issues = dbApi.all(`
-            SELECT 
-                qty,
-                issueDate,
-                mrnNum,
-                vehicleMachinery,
-                issuedTo,
-                issuedBy,
-                notes
-            FROM issues
-            WHERE LOWER(TRIM(itemName)) = ?
-            ORDER BY issueDateISO DESC, id DESC
+            SELECT
+                iss.qty,
+                iss.issueDate,
+                iss.mrnNum,
+                iss.vehicleMachinery,
+                iss.issuedTo,
+                iss.issuedBy,
+                iss.notes
+            FROM issues iss
+            LEFT JOIN items it ON it.id = iss.itemId
+            WHERE LOWER(TRIM(COALESCE(it.itemName, iss.itemName))) = ?
+            ORDER BY iss.issueDateISO DESC, iss.id DESC
         `, [cleanName]);
 
         const linkedItem = dbApi.get(`
