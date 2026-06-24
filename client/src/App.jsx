@@ -5,6 +5,8 @@ import Dashboard from './features/dashboard/Dashboard.jsx';
 import Tracker from './features/tracker/Tracker.jsx';
 import Receiving from './features/receiving/Receiving.jsx';
 import Pricing from './features/pricing/Pricing.jsx';
+import Issued from './features/issued/Issued.jsx';
+import Inventory from './features/inventory/Inventory.jsx';
 import Admin from './features/admin/Admin.jsx';
 import Login from './features/auth/Login.jsx';
 import { useAuth } from './auth/AuthContext.jsx';
@@ -18,6 +20,8 @@ function ported(user) {
     '/tracker': <Tracker />,
     '/receiving': <Receiving />,
     '/pricing': <Pricing />,
+    '/issued': <Issued />,
+    '/inventory': <Inventory />,
     '/admin': user?.role === 'admin' ? <Admin /> : <Placeholder title="Admins only" legacyHint="Ask an administrator for access." />,
   };
 }
