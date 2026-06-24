@@ -64,15 +64,35 @@ const ok = (cond, label, extra = '') => { (cond ? pass++ : fail++); console.log(
     let it = page.items[0];
     ok(it.recQty === 3 && it.receipts.length === 1 && it.receipts[0].grnNumber === 'GRN-99', 'recQty computed + GRN saved', `recQty=${it.recQty}`);
 
-    // ISSUES CRUD
-    let { body: iss } = await j(await fetch(BASE + '/api/issues', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ issueDate: '2026-06-05', vehicleMachinery: 'TEST-VH', itemName: 'Air Filter', qty: 2, issuedTo: 'Site A', issuedBy: 'Store' }) }));
-    ok(iss.success && iss.id && iss.category === 'Filters', 'POST /api/issues auto-classifies', `id=${iss.id}`);
-    const issId = iss.id;
+    // ISSUES — must draw from received stock (requested -> received -> issued)
+    // Line mode: issue 2 of the 3 received against this exact item line.
+    let { body: iss } = await j(await fetch(BASE + '/api/issues', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ itemId, qty: 2, issueDate: '2026-06-05', issuedTo: 'Site A', issuedBy: 'Store' }) }));
+    ok(iss.success && Array.isArray(iss.ids) && iss.ids.length === 1, 'POST /api/issues (line mode) draws from received stock', `ids=${JSON.stringify(iss.ids)}`);
+    const issId = iss.ids[0];
+
+    // available is now 1 (received 3 - issued 2): over-issue is blocked
+    let { status: overStatus } = await j(await fetch(BASE + '/api/issues', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ itemId, qty: 5 }) }));
+    ok(overStatus === 400, 'over-issue beyond available is blocked (400)', `status=${overStatus}`);
+
+    // the item line now exposes issuedQty for the tracker interconnection
+    ({ body: page } = await j(await fetch(BASE + '/api/items?page=1&limit=1&search=TEST-001')));
+    ok(page.items[0].issuedQty === 2, 'item line exposes issuedQty', `issuedQty=${page.items[0].issuedQty}`);
+
+    // issuable-stock (line) lists this line with available 1
+    let { body: stockLine } = await j(await fetch(BASE + '/api/issuable-stock?mode=line&search=' + encodeURIComponent('150 Amp Battery')));
+    ok(Array.isArray(stockLine) && stockLine.some(r => r.itemId === itemId && r.available === 1), 'GET /api/issuable-stock (line) shows available 1');
+
     let { body: issList } = await j(await fetch(BASE + '/api/issues?vehicle=TEST-VH'));
     ok(Array.isArray(issList) && issList.length === 1, 'GET /api/issues vehicle filter');
-    await j(await fetch(BASE + '/api/issues/' + issId, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ issueDate: '2026-06-05', vehicleMachinery: 'TEST-VH', itemName: 'Air Filter', qty: 9, issuedTo: 'Site B', issuedBy: 'Store' }) }));
+
+    // edit: qty 3 allowed (received 3, excluding this issue's own qty); qty 9 blocked
+    let { body: up1 } = await j(await fetch(BASE + '/api/issues/' + issId, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ issueDate: '2026-06-05', vehicleMachinery: 'TEST-VH', itemName: '150 Amp Battery', qty: 3, issuedTo: 'Site B', issuedBy: 'Store' }) }));
+    ok(up1.success, 'PUT /api/issues within available updates');
+    let { status: upOver } = await j(await fetch(BASE + '/api/issues/' + issId, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ issueDate: '2026-06-05', itemName: '150 Amp Battery', qty: 9 }) }));
+    ok(upOver === 400, 'PUT beyond available is blocked (400)', `status=${upOver}`);
+
     ({ body: issList } = await j(await fetch(BASE + '/api/issues?vehicle=TEST-VH')));
-    ok(issList[0].qty === 9 && issList[0].issuedTo === 'Site B', 'PUT /api/issues updates');
+    ok(issList[0].qty === 3 && issList[0].issuedTo === 'Site B', 'issue reflects last valid update');
 
     // DELETE everything we created
     let { body: dIss } = await j(await fetch(BASE + '/api/issues/' + issId, { method: 'DELETE', headers: { 'x-delete-password': 'E&CWorkshop' } }));
