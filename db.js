@@ -164,6 +164,8 @@ function init() {
         CREATE INDEX IF NOT EXISTS idx_receipts_itemId  ON receipts(itemId);
         CREATE INDEX IF NOT EXISTS idx_receipts_dateISO ON receipts(deliveryDateISO);
         CREATE INDEX IF NOT EXISTS idx_receipts_type    ON receipts(transactionType);
+        CREATE INDEX IF NOT EXISTS idx_receipts_supplier ON receipts(supplierName);
+        CREATE INDEX IF NOT EXISTS idx_receipts_spend   ON receipts(qty, unitPrice);
         CREATE INDEX IF NOT EXISTS idx_issues_vehicle   ON issues(vehicleMachinery);
         CREATE INDEX IF NOT EXISTS idx_issues_dateISO   ON issues(issueDateISO);
     `);
@@ -240,6 +242,46 @@ function init() {
         CREATE INDEX IF NOT EXISTS idx_transfers_from ON material_transfers(fromLocation);
         CREATE INDEX IF NOT EXISTS idx_transfers_to ON material_transfers(toLocation);
         CREATE INDEX IF NOT EXISTS idx_transfers_mtn ON material_transfers(mtnNum);
+    `);
+
+    // Create General Items & Transactions Tables
+    exec(`
+        CREATE TABLE IF NOT EXISTS general_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            itemName TEXT NOT NULL,
+            partNumber TEXT,
+            category TEXT,
+            specification TEXT,
+            unit TEXT DEFAULT 'Pcs',
+            rackNumber TEXT,
+            minStock REAL DEFAULT 0,
+            notes TEXT,
+            createdAt TEXT,
+            updatedAt TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS general_item_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            itemId INTEGER,
+            txDate TEXT,
+            txDateISO TEXT,
+            txType TEXT,
+            mrnNum TEXT,
+            grnNum TEXT,
+            vehicleMachinery TEXT,
+            qty REAL DEFAULT 0,
+            balance REAL DEFAULT 0,
+            remarks TEXT,
+            transferredToRack TEXT,
+            createdAt TEXT,
+            updatedAt TEXT,
+            FOREIGN KEY (itemId) REFERENCES general_items(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_general_items_lookup ON general_items(rackNumber, category, itemName);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_general_items_name_rack ON general_items(itemName, rackNumber);
+        CREATE INDEX IF NOT EXISTS idx_gi_tx_item_date ON general_item_transactions(itemId, txDateISO);
+        CREATE INDEX IF NOT EXISTS idx_gi_tx_type ON general_item_transactions(txType);
     `);
 
     // Lightweight migration: add the category column if upgrading an older DB.

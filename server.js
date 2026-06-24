@@ -632,6 +632,642 @@ app.delete('/api/batteries/:id', verifyDeletePassword, (req, res) => {
 });
 
 
+
+// ===========================================================================
+// Dashboard Optimization & Server-Side Aggregation API Endpoints
+// ===========================================================================
+
+app.get('/api/active-items', (req, res) => {
+    try {
+        const rows = dbApi.all(`
+            WITH item_rec_iss AS (
+                SELECT 
+                    i.id,
+                    i.mrnNum,
+                    i.itemName,
+                    i.itemName AS name,
+                    i.vehicleMachinery,
+                    i.category,
+                    i.itemDesc,
+                    i.reqQty,
+                    i.reqDate,
+                    COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AS recQty,
+                    COALESCE((
+                        SELECT SUM(qty) FROM issues iss 
+                        WHERE (
+                            (i.mrnNum IS NOT NULL AND i.mrnNum != '' AND iss.mrnNum = i.mrnNum)
+                            OR 
+                            ((i.mrnNum IS NULL OR i.mrnNum = '') AND i.vehicleMachinery IS NOT NULL AND i.vehicleMachinery != '' AND iss.vehicleMachinery = i.vehicleMachinery)
+                        )
+                        AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName))
+                    ), 0) AS issuedQty
+                FROM items i
+            )
+            SELECT * FROM item_rec_iss
+            WHERE recQty > 0 AND issuedQty < recQty
+        `);
+        res.json(rows);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/fleet', (req, res) => {
+    try {
+        const rows = dbApi.all(`
+            WITH all_vehicles AS (
+                SELECT DISTINCT TRIM(vehicleMachinery) AS vehicle FROM items WHERE TRIM(COALESCE(vehicleMachinery, '')) != ''
+                UNION
+                SELECT DISTINCT TRIM(vehicleMachinery) AS vehicle FROM issues WHERE TRIM(COALESCE(vehicleMachinery, '')) != ''
+            ),
+            item_stats AS (
+                SELECT 
+                    i.id,
+                    TRIM(i.vehicleMachinery) AS vehicle,
+                    i.reqQty,
+                    COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AS recQty,
+                    COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.mrnNum = i.mrnNum AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName))), 0) AS issuedQty,
+                    CASE WHEN i.reqQty > COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) THEN 1 ELSE 0 END AS is_pending_supplier,
+                    CASE WHEN COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) > COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.mrnNum = i.mrnNum AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName))), 0) THEN 1 ELSE 0 END AS is_pending_workshop,
+                    CASE WHEN i.reqQty > COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AND TRIM(COALESCE(i.reqDateISO, '')) != '' AND i.reqDateISO < DATE('now', 'localtime') THEN 1 ELSE 0 END AS is_overdue,
+                    1 AS item_line
+                FROM items i
+                WHERE TRIM(COALESCE(i.vehicleMachinery, '')) != ''
+            ),
+            vehicle_agg AS (
+                SELECT 
+                    vehicle AS name,
+                    SUM(is_pending_supplier) AS pendingSupplierCount,
+                    SUM(is_pending_workshop) AS pendingWorkshopCount,
+                    SUM(is_overdue) AS hasOverdue,
+                    SUM(reqQty) AS totalReq,
+                    SUM(CASE WHEN reqQty < issuedQty THEN reqQty ELSE issuedQty END) AS totalIssued,
+                    SUM(item_line) AS totalLines
+                FROM item_stats
+                GROUP BY vehicle
+            )
+            SELECT 
+                av.vehicle AS name,
+                COALESCE(va.pendingSupplierCount, 0) AS pendingSupplierCount,
+                COALESCE(va.pendingWorkshopCount, 0) AS pendingWorkshopCount,
+                CASE WHEN COALESCE(va.hasOverdue, 0) > 0 THEN 1 ELSE 0 END AS hasOverdue,
+                COALESCE(va.totalLines, 0) AS totalLines,
+                CAST(
+                    CASE WHEN COALESCE(va.totalReq, 0) > 0 
+                    THEN ROUND((COALESCE(va.totalIssued, 0) * 100.0) / va.totalReq)
+                    ELSE 0 
+                    END AS INTEGER
+                ) AS progressPct
+            FROM all_vehicles av
+            LEFT JOIN vehicle_agg va ON av.vehicle = va.name
+            ORDER BY av.vehicle COLLATE NOCASE ASC
+        `);
+        res.json(rows);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/fleet/details', (req, res) => {
+    try {
+        const veh = req.query.vehicle;
+        if (!veh) return res.status(400).json({ error: 'Vehicle name is required' });
+        const trimVeh = veh.trim();
+
+        // Get items for vehicle
+        const items = dbApi.all(`
+            SELECT 
+                i.*,
+                COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AS recQty
+            FROM items i
+            WHERE TRIM(i.vehicleMachinery) = ?
+            ORDER BY i.id DESC
+        `, [trimVeh]);
+
+        // Prefill receipts for items
+        const itemIds = items.map(item => item.id);
+        if (itemIds.length > 0) {
+            const receipts = dbApi.all(`
+                SELECT * FROM receipts
+                WHERE itemId IN (${itemIds.map(() => '?').join(',')})
+            `, itemIds);
+            
+            items.forEach(item => {
+                item.receipts = receipts.filter(r => r.itemId === item.id);
+                item.recQty = item.receipts.reduce((sum, r) => sum + r.qty, 0);
+            });
+        }
+        
+        const issues = dbApi.all(`
+            SELECT * FROM issues
+            WHERE TRIM(vehicleMachinery) = ?
+            ORDER BY issueDateISO DESC, id DESC
+        `, [trimVeh]);
+        
+        res.json({ items, issues });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/open-mrns', (req, res) => {
+    try {
+        const rows = dbApi.all(`
+            SELECT 
+                mrnNum,
+                COUNT(*) AS count,
+                MAX(vehicleMachinery) AS vehicle
+            FROM items
+            WHERE reqQty > (SELECT COALESCE(SUM(qty), 0) FROM receipts WHERE itemId = items.id)
+              AND TRIM(COALESCE(mrnNum, '')) != ''
+            GROUP BY mrnNum
+            ORDER BY mrnNum ASC
+        `);
+        res.json(rows);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/sidebar-stats', (req, res) => {
+    try {
+        const totalItems = dbApi.get(`SELECT COUNT(*) AS c FROM items`).c;
+        const pendingDelivery = dbApi.get(`
+            SELECT COUNT(*) AS c 
+            FROM items i 
+            WHERE i.reqQty > (SELECT COALESCE(SUM(qty), 0) FROM receipts r WHERE r.itemId = i.id)
+        `).c;
+
+        const pendingPricing = dbApi.get(`
+            WITH item_pricing AS (
+                SELECT 
+                    itemId,
+                    COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AS recQty,
+                    MAX(CASE WHEN r.unitPrice IS NULL OR r.unitPrice = 0 THEN 1 ELSE 0 END) AS has_unpriced,
+                    COUNT(r.id) AS recCount
+                FROM items i
+                LEFT JOIN receipts r ON r.itemId = i.id
+                GROUP BY i.id
+            )
+            SELECT COUNT(*) AS c 
+            FROM item_pricing
+            WHERE recQty >= (SELECT reqQty FROM items WHERE id = itemId) 
+              AND recCount > 0 
+              AND has_unpriced = 1
+        `).c;
+
+        // Stock room in-stock items:
+        // We want to count distinct SKUs with currentStock > 0
+        const inStockBase = dbApi.get(`
+            WITH received_totals AS (
+                SELECT LOWER(TRIM(i.itemName)) AS cleanName, SUM(r.qty) AS totalReceived
+                FROM items i
+                JOIN receipts r ON r.itemId = i.id
+                WHERE r.qty > 0
+                GROUP BY LOWER(TRIM(i.itemName))
+            ),
+            issued_totals AS (
+                SELECT LOWER(TRIM(itemName)) AS cleanName, SUM(qty) AS totalIssued
+                FROM issues
+                WHERE qty > 0
+                GROUP BY LOWER(TRIM(itemName))
+            ),
+            all_names AS (
+                SELECT cleanName FROM received_totals
+                UNION
+                SELECT cleanName FROM issued_totals
+            )
+            SELECT COUNT(*) AS c
+            FROM all_names an
+            LEFT JOIN received_totals r ON an.cleanName = r.cleanName
+            LEFT JOIN issued_totals i ON an.cleanName = i.cleanName
+            WHERE (COALESCE(r.totalReceived, 0) - COALESCE(i.totalIssued, 0)) > 0
+        `).c;
+
+        const totalIssues = dbApi.get(`SELECT COUNT(*) AS c FROM issues`).c;
+
+        res.json({
+            totalItems,
+            pendingDelivery,
+            pendingPricing,
+            inStockCount: inStockBase,
+            totalIssues
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/dashboard/summary', (req, res) => {
+    try {
+        const spendRow = dbApi.get(`
+            SELECT COALESCE(SUM(qty * unitPrice), 0) AS totalSpend 
+            FROM receipts 
+            WHERE qty > 0 AND unitPrice > 0
+        `);
+        const totalSpend = spendRow.totalSpend;
+
+        const supplierCount = dbApi.get(`
+            SELECT COUNT(DISTINCT supplierName) AS c 
+            FROM receipts 
+            WHERE supplierName IS NOT NULL AND supplierName != '' AND qty > 0 AND unitPrice > 0
+        `).c;
+
+        const pricedCount = dbApi.get(`
+            SELECT COUNT(DISTINCT itemId) AS c 
+            FROM receipts 
+            WHERE qty > 0 AND unitPrice > 0
+        `).c;
+
+        const unpricedReceivedCount = dbApi.get(`
+            SELECT COUNT(DISTINCT i.id) AS c 
+            FROM items i
+            WHERE (SELECT COALESCE(SUM(qty), 0) FROM receipts r WHERE r.itemId = i.id) > 0
+              AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.itemId = i.id AND r.qty > 0 AND r.unitPrice > 0)
+        `).c;
+
+        const supplierSpendRows = dbApi.all(`
+            SELECT 
+                COALESCE(supplierName, 'Unknown Supplier') AS supplier,
+                SUM(qty * unitPrice) AS total
+            FROM receipts
+            WHERE qty > 0 AND unitPrice > 0
+            GROUP BY COALESCE(supplierName, 'Unknown Supplier')
+        `);
+        const supplierSpend = {};
+        supplierSpendRows.forEach(r => {
+            supplierSpend[r.supplier] = r.total;
+        });
+
+        res.json({
+            totalSpend,
+            supplierCount,
+            pricedCount,
+            unpricedReceivedCount,
+            supplierSpend
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/dashboard/charts', (req, res) => {
+    try {
+        const spendTrend = dbApi.all(`
+            SELECT deliveryDateISO AS date, SUM(qty * unitPrice) AS dailyTotal
+            FROM receipts
+            WHERE qty > 0 AND unitPrice > 0 AND TRIM(COALESCE(deliveryDateISO, '')) != ''
+            GROUP BY deliveryDateISO
+            ORDER BY deliveryDateISO ASC
+        `);
+        
+        let cumulative = 0;
+        const trend = spendTrend.map(row => {
+            cumulative += row.dailyTotal;
+            return { date: row.date, cumulative: Math.round(cumulative) };
+        });
+
+        const supplierSpend = dbApi.all(`
+            SELECT TRIM(supplierName) AS supplier, SUM(qty * unitPrice) AS total
+            FROM receipts
+            WHERE qty > 0 AND unitPrice > 0 AND TRIM(COALESCE(supplierName, '')) != ''
+            GROUP BY TRIM(supplierName)
+            ORDER BY total DESC
+        `);
+
+        res.json({ trend, supplierSpend });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/dashboard/inflow', (req, res) => {
+    try {
+        const rows = dbApi.all(`
+            SELECT 
+                r.id,
+                r.qty,
+                r.deliveryDate,
+                r.deliveryDateISO,
+                r.purchaseSource,
+                r.unitPrice,
+                r.transactionType,
+                i.itemName AS name,
+                i.mrnNum,
+                i.vehicleMachinery
+            FROM receipts r
+            JOIN items i ON r.itemId = i.id
+            WHERE r.qty > 0 AND TRIM(COALESCE(r.deliveryDateISO, '')) != ''
+            ORDER BY r.deliveryDateISO DESC, r.id DESC
+        `);
+
+        // Group them inside backend JS to preserve exact frontend nested structures
+        const dailyData = {};
+        rows.forEach(r => {
+            const date = r.deliveryDateISO;
+            if (!dailyData[date]) {
+                dailyData[date] = {
+                    date: date,
+                    totalValue: 0,
+                    hoValue: 0,
+                    lpValue: 0,
+                    otherValue: 0,
+                    totalCount: 0,
+                    unpricedCount: 0,
+                    receipts: []
+                };
+            }
+
+            const cost = (r.unitPrice || 0) * r.qty;
+            const isPriced = r.unitPrice !== null && r.unitPrice !== undefined && r.unitPrice > 0;
+
+            dailyData[date].totalValue += cost;
+            dailyData[date].totalCount++;
+            if (!isPriced) {
+                dailyData[date].unpricedCount++;
+            }
+
+            const src = (r.purchaseSource || '').trim().toLowerCase();
+            let category = 'other';
+            if (src === 'direct purchase' || src === 'head office' || src === 'pre-ordered') {
+                category = 'headOffice';
+                dailyData[date].hoValue += cost;
+            } else if (src === 'local store' || src === 'local purchase') {
+                category = 'localPurchase';
+                dailyData[date].lpValue += cost;
+            } else {
+                dailyData[date].otherValue += cost;
+            }
+
+            dailyData[date].receipts.push({
+                id: r.id,
+                qty: r.qty,
+                deliveryDate: r.deliveryDate,
+                deliveryDateISO: r.deliveryDateISO,
+                purchaseSource: r.purchaseSource,
+                unitPrice: r.unitPrice,
+                itemName: r.name,
+                mrnNum: r.mrnNum,
+                vehicleMachinery: r.vehicleMachinery,
+                cost: cost,
+                isPriced: isPriced,
+                sourceCategory: category
+            });
+        });
+
+        res.json(dailyData);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/dashboard/urgent', (req, res) => {
+    try {
+        const today = new Date().toISOString().split('T')[0];
+        const rows = dbApi.all(`
+            SELECT 
+                i.id,
+                i.mrnNum,
+                i.vehicleMachinery,
+                i.itemName AS name,
+                i.itemDesc,
+                i.reqDate,
+                i.reqQty,
+                COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AS recQty
+            FROM items i
+            WHERE i.reqQty > (SELECT COALESCE(SUM(qty), 0) FROM receipts r WHERE r.itemId = i.id)
+              AND TRIM(COALESCE(i.reqDateISO, '')) != '' 
+              AND i.reqDateISO < ?
+            ORDER BY i.reqDateISO DESC, i.id DESC
+        `, [today]);
+        res.json(rows);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/dashboard/transfers-timeline', (req, res) => {
+    try {
+        const rows = dbApi.all(`
+            SELECT * FROM material_transfers
+            ORDER BY transferDateISO DESC, id DESC
+            LIMIT 5
+        `);
+        res.json(rows);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/all-vehicles', (req, res) => {
+    try {
+        const rows = dbApi.all(`
+            SELECT DISTINCT TRIM(vehicleMachinery) AS vehicle 
+            FROM items 
+            WHERE TRIM(COALESCE(vehicleMachinery, '')) != '' 
+            ORDER BY vehicle COLLATE NOCASE
+        `);
+        res.json(rows.map(r => r.vehicle));
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/all-categories', (req, res) => {
+    try {
+        const rows = dbApi.all(`
+            SELECT DISTINCT TRIM(category) AS category 
+            FROM items 
+            WHERE TRIM(COALESCE(category, '')) != '' 
+            ORDER BY category COLLATE NOCASE
+        `);
+        res.json(rows.map(r => r.category));
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/inventory', (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 25;
+        const search = req.query.search ? `%${req.query.search}%` : null;
+        const category = req.query.category && req.query.category !== 'all' ? req.query.category : null;
+        const status = req.query.status && req.query.status !== 'all' ? req.query.status : null;
+
+        const sort = req.query.sort || 'itemName';
+        const order = (req.query.order || 'asc').toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+
+        const params = [];
+        const whereClauses = [];
+
+        if (search) {
+            whereClauses.push('(itemName LIKE ? OR category LIKE ?)');
+            params.push(search, search);
+        }
+        if (category) {
+            whereClauses.push('category = ?');
+            params.push(category);
+        }
+        if (status) {
+            whereClauses.push('status = ?');
+            params.push(status);
+        }
+
+        const whereSql = whereClauses.length ? 'WHERE ' + whereClauses.join(' AND ') : '';
+
+        // Validate sort column to avoid SQL injection
+        const validSortCols = ['itemName', 'category', 'totalReceived', 'totalIssued', 'currentStock', 'status'];
+        const sortCol = validSortCols.includes(sort) ? sort : 'itemName';
+
+        const cte = `
+            WITH received_totals AS (
+                SELECT LOWER(TRIM(i.itemName)) AS cleanName, MAX(i.itemName) AS itemName, MAX(i.category) AS category, SUM(r.qty) AS totalReceived
+                FROM items i
+                JOIN receipts r ON r.itemId = i.id
+                WHERE r.qty > 0
+                GROUP BY LOWER(TRIM(i.itemName))
+            ),
+            issued_totals AS (
+                SELECT LOWER(TRIM(itemName)) AS cleanName, MAX(itemName) AS itemName, MAX(category) AS category, SUM(qty) AS totalIssued
+                FROM issues
+                WHERE qty > 0
+                GROUP BY LOWER(TRIM(itemName))
+            ),
+            all_names AS (
+                SELECT cleanName, itemName, category FROM received_totals
+                UNION
+                SELECT cleanName, itemName, category FROM issued_totals
+            ),
+            inventory_base AS (
+                SELECT 
+                    an.cleanName,
+                    COALESCE(r.itemName, an.itemName) AS itemName,
+                    COALESCE(r.category, an.category, 'General Items') AS category,
+                    ROUND(COALESCE(r.totalReceived, 0), 2) AS totalReceived,
+                    ROUND(COALESCE(i.totalIssued, 0), 2) AS totalIssued,
+                    ROUND(COALESCE(r.totalReceived, 0) - COALESCE(i.totalIssued, 0), 2) AS currentStock,
+                    CASE 
+                        WHEN (COALESCE(r.totalReceived, 0) - COALESCE(i.totalIssued, 0)) < 0 THEN 'anomaly'
+                        WHEN (COALESCE(r.totalReceived, 0) - COALESCE(i.totalIssued, 0)) = 0 THEN 'outstock'
+                        WHEN (COALESCE(r.totalReceived, 0) - COALESCE(i.totalIssued, 0)) <= 2 THEN 'lowstock'
+                        ELSE 'instock'
+                    END AS status
+                FROM all_names an
+                LEFT JOIN received_totals r ON an.cleanName = r.cleanName
+                LEFT JOIN issued_totals i ON an.cleanName = i.cleanName
+            )
+        `;
+
+        // Get total count matching filters
+        const countRow = dbApi.get(`
+            \${cte}
+            SELECT COUNT(*) AS c FROM inventory_base
+            \${whereSql}
+        `, params);
+        const total = countRow.c;
+
+        // Get paginated and sorted items
+        const skip = (page - 1) * limit;
+        const items = dbApi.all(`
+            \${cte}
+            SELECT * FROM inventory_base
+            \${whereSql}
+            ORDER BY \${sortCol} \${order}
+            LIMIT ? OFFSET ?
+        `, [...params, limit, skip]);
+
+        // Get dynamic KPIs over the entire list
+        const kpis = dbApi.get(`
+            \${cte}
+            SELECT 
+                COUNT(*) AS totalSKUs,
+                SUM(CASE WHEN status = 'instock' THEN 1 ELSE 0 END) AS inStock,
+                SUM(CASE WHEN status = 'lowstock' THEN 1 ELSE 0 END) AS lowStock,
+                SUM(CASE WHEN status = 'outstock' THEN 1 ELSE 0 END) AS outOfStock,
+                SUM(CASE WHEN status = 'anomaly' THEN 1 ELSE 0 END) AS discrepancies
+            FROM inventory_base
+        `);
+
+        // Compute dynamic counts per category for the chips (over the entire base list)
+        const categoryCounts = dbApi.all(`
+            \${cte}
+            SELECT category, COUNT(*) AS count
+            FROM inventory_base
+            GROUP BY category
+        `);
+
+        res.json({
+            items,
+            total,
+            page,
+            limit,
+            kpis: {
+                totalSKUs: kpis.totalSKUs || 0,
+                inStock: kpis.inStock || 0,
+                lowStock: kpis.lowStock || 0,
+                outOfStock: kpis.outOfStock || 0,
+                discrepancies: kpis.discrepancies || 0
+            },
+            categoryCounts
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/inventory/details', (req, res) => {
+    try {
+        const cleanName = s(req.query.cleanName).trim().toLowerCase();
+        if (!cleanName) return res.status(400).json({ error: 'cleanName is required' });
+
+        // Get receipts
+        const receipts = dbApi.all(`
+            SELECT 
+                r.qty,
+                r.deliveryDate,
+                r.purchaseSource,
+                r.grnNumber,
+                r.invoiceNumber,
+                r.unitPrice,
+                r.transactionType,
+                i.mrnNum,
+                i.vehicleMachinery
+            FROM receipts r
+            JOIN items i ON r.itemId = i.id
+            WHERE LOWER(TRIM(i.itemName)) = ?
+            ORDER BY r.deliveryDateISO DESC, r.id DESC
+        `, [cleanName]);
+
+        // Get issues
+        const issues = dbApi.all(`
+            SELECT 
+                qty,
+                issueDate,
+                mrnNum,
+                vehicleMachinery,
+                issuedTo,
+                issuedBy,
+                notes
+            FROM issues
+            WHERE LOWER(TRIM(itemName)) = ?
+            ORDER BY issueDateISO DESC, id DESC
+        `, [cleanName]);
+
+        const linkedItem = dbApi.get(`
+            SELECT id, itemName, category
+            FROM items
+            WHERE LOWER(TRIM(itemName)) = ?
+            LIMIT 1
+        `, [cleanName]);
+
+        res.json({ receipts, issues, linkedItem });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+
 // ===========================================================================
 // Material Transfer API Endpoints
 // ===========================================================================
@@ -758,6 +1394,311 @@ app.delete('/api/transfers/:id', verifyDeletePassword, (req, res) => {
         const id = parseInt(req.params.id);
         dbApi.run(`DELETE FROM material_transfers WHERE id = ?`, [id]);
         res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ===========================================================================
+// General Items & Racks API Endpoints
+// ===========================================================================
+
+app.get('/api/general-items', (req, res) => {
+    try {
+        const where = [];
+        const params = [];
+        
+        if (req.query.search) {
+            const like = `%${req.query.search}%`;
+            where.push(`(gi.itemName LIKE ? OR gi.partNumber LIKE ? OR gi.specification LIKE ? OR gi.notes LIKE ?)`);
+            params.push(like, like, like, like);
+        }
+        if (req.query.rack && req.query.rack !== 'all') {
+            where.push(`gi.rackNumber = ?`);
+            params.push(req.query.rack);
+        }
+        if (req.query.category && req.query.category !== 'all') {
+            where.push(`gi.category = ?`);
+            params.push(req.query.category);
+        }
+        
+        const clause = where.length ? 'WHERE ' + where.join(' AND ') : '';
+        const sql = `
+            SELECT gi.*,
+            COALESCE((
+                SELECT balance
+                FROM general_item_transactions
+                WHERE itemId = gi.id
+                ORDER BY txDateISO DESC, id DESC
+                LIMIT 1
+            ), 0) AS currentStock
+            FROM general_items gi
+            ${clause}
+            ORDER BY gi.rackNumber ASC, gi.itemName COLLATE NOCASE ASC
+        `;
+        let rows = dbApi.all(sql, params);
+        
+        if (req.query.stockStatus && req.query.stockStatus !== 'all') {
+            if (req.query.stockStatus === 'low') {
+                rows = rows.filter(r => r.currentStock <= r.minStock && r.currentStock > 0);
+            } else if (req.query.stockStatus === 'out') {
+                rows = rows.filter(r => r.currentStock <= 0);
+            } else if (req.query.stockStatus === 'in') {
+                rows = rows.filter(r => r.currentStock > 0);
+            }
+        }
+        res.json(rows);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/general-items/stats', (req, res) => {
+    try {
+        const stats = dbApi.get(`
+            WITH item_stocks AS (
+                SELECT gi.id, gi.minStock,
+                COALESCE((
+                    SELECT balance
+                    FROM general_item_transactions
+                    WHERE itemId = gi.id
+                    ORDER BY txDateISO DESC, id DESC
+                    LIMIT 1
+                ), 0) AS currentStock
+                FROM general_items gi
+            )
+            SELECT
+                (SELECT COUNT(*) FROM general_items) AS totalSKUs,
+                (SELECT COUNT(*) FROM item_stocks WHERE currentStock <= 0) AS outOfStock,
+                (SELECT COUNT(*) FROM item_stocks WHERE currentStock <= minStock AND currentStock > 0) AS lowStock,
+                (SELECT COUNT(*) FROM general_item_transactions) AS totalTransactions
+        `);
+        const rackCounts = dbApi.all(`
+            SELECT rackNumber, COUNT(*) AS count
+            FROM general_items
+            GROUP BY rackNumber
+        `);
+        res.json({
+            totalSKUs: stats.totalSKUs || 0,
+            outOfStock: stats.outOfStock || 0,
+            lowStock: stats.lowStock || 0,
+            totalTransactions: stats.totalTransactions || 0,
+            rackCounts
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/general-items/racks', (req, res) => {
+    try {
+        const rows = dbApi.all(`
+            SELECT DISTINCT TRIM(rackNumber) AS r
+            FROM general_items
+            WHERE TRIM(COALESCE(rackNumber, '')) != ''
+            ORDER BY r
+        `);
+        res.json(rows.map(row => row.r));
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/general-items/subcategories', (req, res) => {
+    try {
+        const rows = dbApi.all(`
+            SELECT DISTINCT TRIM(category) AS cat
+            FROM general_items
+            WHERE TRIM(COALESCE(category, '')) != ''
+            ORDER BY cat
+        `);
+        res.json(rows.map(row => row.cat));
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/general-items/:id', (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        const item = dbApi.get(`SELECT * FROM general_items WHERE id = ?`, [id]);
+        if (!item) return res.status(404).json({ error: 'General Item not found' });
+        
+        item.currentStock = dbApi.get(`
+            SELECT COALESCE(balance, 0) AS balance
+            FROM general_item_transactions
+            WHERE itemId = ?
+            ORDER BY txDateISO DESC, id DESC
+            LIMIT 1
+        `, [id])?.balance || 0;
+        
+        const transactions = dbApi.all(`
+            SELECT *
+            FROM general_item_transactions
+            WHERE itemId = ?
+            ORDER BY txDateISO DESC, id DESC
+        `, [id]);
+        item.transactions = transactions;
+        res.json(item);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/general-items', (req, res) => {
+    try {
+        const b = req.body || {};
+        const itemName = s(b.itemName).trim();
+        const rackNumber = s(b.rackNumber).trim();
+        if (!itemName) return res.status(400).json({ error: 'Item name is required' });
+        
+        const exists = dbApi.get(`
+            SELECT id FROM general_items
+            WHERE UPPER(TRIM(itemName)) = UPPER(?) AND UPPER(TRIM(rackNumber)) = UPPER(?)
+        `, [itemName, rackNumber]);
+        if (exists) {
+            return res.status(409).json({ error: `Item "${itemName}" is already registered in Rack "${rackNumber}".` });
+        }
+        
+        const now = nowISO();
+        const r = dbApi.run(`
+            INSERT INTO general_items (itemName, partNumber, category, specification, unit, rackNumber, minStock, notes, createdAt, updatedAt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [itemName, s(b.partNumber), s(b.category || 'General Items'), s(b.specification), s(b.unit || 'Pcs'), rackNumber, Number(b.minStock) || 0, s(b.notes), now, now]);
+        
+        res.json({ success: true, id: r.lastInsertRowid });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.put('/api/general-items/:id', (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        const b = req.body || {};
+        const itemName = s(b.itemName).trim();
+        const rackNumber = s(b.rackNumber).trim();
+        if (!itemName) return res.status(400).json({ error: 'Item name is required' });
+        
+        const exists = dbApi.get(`
+            SELECT id FROM general_items
+            WHERE UPPER(TRIM(itemName)) = UPPER(?) AND UPPER(TRIM(rackNumber)) = UPPER(?) AND id != ?
+        `, [itemName, rackNumber, id]);
+        if (exists) {
+            return res.status(409).json({ error: `Item "${itemName}" is already registered in Rack "${rackNumber}".` });
+        }
+        
+        const now = nowISO();
+        dbApi.run(`
+            UPDATE general_items
+            SET itemName = ?, partNumber = ?, category = ?, specification = ?, unit = ?, rackNumber = ?, minStock = ?, notes = ?, updatedAt = ?
+            WHERE id = ?
+        `, [itemName, s(b.partNumber), s(b.category || 'General Items'), s(b.specification), s(b.unit || 'Pcs'), rackNumber, Number(b.minStock) || 0, s(b.notes), now, id]);
+        
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.delete('/api/general-items/:id', verifyDeletePassword, (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        dbApi.transaction(() => {
+            dbApi.run(`DELETE FROM general_item_transactions WHERE itemId = ?`, [id]);
+            dbApi.run(`DELETE FROM general_items WHERE id = ?`, [id]);
+        });
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/general-items/transaction', (req, res) => {
+    try {
+        const b = req.body || {};
+        const itemId = parseInt(b.itemId);
+        const txType = s(b.txType); // 'Receive', 'Issue', 'Transfer'
+        const txDate = s(b.txDate);
+        const qty = Number(b.qty) || 0;
+        
+        if (!itemId || !txType || !txDate || qty <= 0) {
+            return res.status(400).json({ error: 'Missing or invalid transaction details (itemId, txType, txDate, qty)' });
+        }
+        
+        const now = nowISO();
+        const txId = dbApi.transaction(() => {
+            const item = dbApi.get(`SELECT * FROM general_items WHERE id = ?`, [itemId]);
+            if (!item) throw new Error('General Item not found');
+            
+            const lastTx = dbApi.get(`
+                SELECT balance
+                FROM general_item_transactions
+                WHERE itemId = ?
+                ORDER BY txDateISO DESC, id DESC LIMIT 1
+            `, [itemId]);
+            const currentBalance = lastTx ? lastTx.balance : 0;
+            
+            let newBalance = currentBalance;
+            if (txType === 'Receive') {
+                newBalance += qty;
+            } else if (txType === 'Issue' || txType === 'Transfer') {
+                newBalance -= qty;
+            } else {
+                throw new Error('Invalid transaction type');
+            }
+            
+            // Insert primary transaction
+            const r = dbApi.run(`
+                INSERT INTO general_item_transactions (itemId, txDate, txDateISO, txType, mrnNum, grnNum, vehicleMachinery, qty, balance, remarks, transferredToRack, createdAt, updatedAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, [itemId, txDate, toISO(txDate), txType, s(b.mrnNum), s(b.grnNum), s(b.vehicleMachinery), qty, newBalance, s(b.remarks), s(b.transferredToRack), now, now]);
+            
+            const newTxId = r.lastInsertRowid;
+            
+            // If Transfer, handle double-sided transaction
+            if (txType === 'Transfer') {
+                const targetRack = s(b.transferredToRack).trim();
+                if (!targetRack) throw new Error('Destination rack is required for transfer');
+                
+                // Find or auto-create item in target rack
+                let targetItem = dbApi.get(`
+                    SELECT * FROM general_items
+                    WHERE UPPER(TRIM(itemName)) = UPPER(?) AND UPPER(TRIM(rackNumber)) = UPPER(?)
+                `, [item.itemName, targetRack]);
+                
+                let targetItemId;
+                if (targetItem) {
+                    targetItemId = targetItem.id;
+                } else {
+                    const insertTarget = dbApi.run(`
+                        INSERT INTO general_items (itemName, partNumber, category, specification, unit, rackNumber, minStock, notes, createdAt, updatedAt)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    `, [item.itemName, item.partNumber, item.category, item.specification, item.unit, targetRack, item.minStock, `Auto-created via transfer from Rack ${item.rackNumber}`, now, now]);
+                    targetItemId = insertTarget.lastInsertRowid;
+                }
+                
+                // Get target current balance
+                const lastTargetTx = dbApi.get(`
+                    SELECT balance
+                    FROM general_item_transactions
+                    WHERE itemId = ?
+                    ORDER BY txDateISO DESC, id DESC LIMIT 1
+                `, [targetItemId]);
+                const targetCurrentBalance = lastTargetTx ? lastTargetTx.balance : 0;
+                const targetNewBalance = targetCurrentBalance + qty;
+                
+                // Log matching Receive transaction for target
+                dbApi.run(`
+                    INSERT INTO general_item_transactions (itemId, txDate, txDateISO, txType, mrnNum, grnNum, vehicleMachinery, qty, balance, remarks, createdAt, updatedAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `, [targetItemId, txDate, toISO(txDate), 'Receive', s(b.mrnNum), s(b.grnNum), `Transferred from Rack ${item.rackNumber}`, qty, targetNewBalance, `Received via transfer from ${item.rackNumber}. ${s(b.remarks || '')}`, now, now]);
+            }
+            
+            return newTxId;
+        });
+        
+        res.json({ success: true, id: txId });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -936,6 +1877,34 @@ app.get('/api/export/excel', (req, res) => {
             ]);
         }
         XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(transfersSheet), 'Material Transfers');
+
+        // General Items sheet
+        const generalItems = dbApi.all(`
+            SELECT gi.*, 
+            COALESCE((SELECT balance FROM general_item_transactions WHERE itemId = gi.id ORDER BY txDateISO DESC, id DESC LIMIT 1), 0) AS currentStock
+            FROM general_items gi
+            ORDER BY gi.rackNumber ASC, gi.itemName COLLATE NOCASE ASC
+        `);
+        const giSheet = [['Rack Number', 'Category', 'Item Name', 'Part Number', 'Specification', 'Unit', 'Current Stock', 'Min Stock Level', 'Notes']];
+        for (const gi of generalItems) {
+            giSheet.push([gi.rackNumber || '', gi.category || '', gi.itemName || '', gi.partNumber || '', gi.specification || '',
+                gi.unit || 'Pcs', gi.currentStock || 0, gi.minStock || 0, gi.notes || '']);
+        }
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(giSheet), 'General Items Stock');
+
+        // General Items Ledger sheet
+        const giTransactions = dbApi.all(`
+            SELECT git.*, gi.itemName, gi.rackNumber
+            FROM general_item_transactions git
+            JOIN general_items gi ON git.itemId = gi.id
+            ORDER BY git.txDateISO DESC, git.id DESC
+        `);
+        const giLedgerSheet = [['Date', 'Item Name', 'Source Rack', 'Transaction Type', 'Qty', 'Balance Post-Tx', 'MRN Ref', 'GRN Ref', 'Destination/Vehicle/Supplier', 'Remarks']];
+        for (const t of giTransactions) {
+            giLedgerSheet.push([t.txDate || '', t.itemName || '', t.rackNumber || '', t.txType || '', t.qty || 0, t.balance || 0,
+                t.mrnNum || '', t.grnNum || '', t.vehicleMachinery || '', t.remarks || '']);
+        }
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(giLedgerSheet), 'General Items Ledger');
 
         const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
         res.setHeader('Content-Disposition', 'attachment; filename="inventory_report.xlsx"');

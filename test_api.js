@@ -292,6 +292,135 @@ const ok = (cond, label, extra = '') => { (cond ? pass++ : fail++); console.log(
     let { status: mtGoneStatus } = await j(await fetch(BASE + '/api/transfers/' + transferId));
     ok(mtGoneStatus === 404, 'Transfer cleanup verified');
 
+    // === GENERAL ITEMS & RACKS API TESTS ===
+    console.log('\n--- Running General Items & Racks API Tests ---');
+
+    // 1. Create general item
+    let { status: giRegStatus, body: giReg } = await j(await fetch(BASE + '/api/general-items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            itemName: 'M8 Bolt Class 8.8',
+            partNumber: 'PN-M8B',
+            category: 'Fasteners',
+            specification: 'M8 x 50mm',
+            unit: 'Pcs',
+            rackNumber: '13A',
+            minStock: 20,
+            notes: 'Test note'
+        })
+    }));
+    ok(giRegStatus === 200 && giReg.success && giReg.id, 'Register general item M8 Bolt in Rack 13A', `id=${giReg.id}`);
+    const gi1Id = giReg.id;
+
+    // 2. Duplicate registration check (should return 409 conflict)
+    let { status: giDupStatus } = await j(await fetch(BASE + '/api/general-items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            itemName: 'M8 Bolt Class 8.8',
+            rackNumber: '13A'
+        })
+    }));
+    ok(giDupStatus === 409, 'Register duplicate general item returns 409 conflict');
+
+    // 3. Update general item attributes
+    let { status: giUpdStatus } = await j(await fetch(BASE + '/api/general-items/' + gi1Id, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            itemName: 'M8 Bolt Class 8.8',
+            partNumber: 'PN-M8B-NEW',
+            category: 'Fasteners',
+            specification: 'M8 x 50mm (High Tensile)',
+            unit: 'Pcs',
+            rackNumber: '13A',
+            minStock: 30,
+            notes: 'Updated note'
+        })
+    }));
+    ok(giUpdStatus === 200, 'Update general item details');
+
+    // 4. Log Receive transaction and verify balance
+    let { status: giRecStatus, body: giRec } = await j(await fetch(BASE + '/api/general-items/transaction', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            itemId: gi1Id,
+            txType: 'Receive',
+            txDate: '2026-06-10',
+            qty: 50,
+            grnNum: 'GRN-GI-01',
+            remarks: 'Initial stock load'
+        })
+    }));
+    ok(giRecStatus === 200 && giRec.success, 'Log Receive transaction and verify balance');
+
+    // 5. Log Issue transaction and verify balance decrement
+    let { status: giIssStatus, body: giIss } = await j(await fetch(BASE + '/api/general-items/transaction', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            itemId: gi1Id,
+            txType: 'Issue',
+            txDate: '2026-06-11',
+            qty: 15,
+            mrnNum: 'MRN-GI-02',
+            vehicleMachinery: 'SL-11',
+            remarks: 'Issued for repair'
+        })
+    }));
+    ok(giIssStatus === 200 && giIss.success, 'Log Issue transaction and verify balance decrement');
+
+    // Verify current stock on item 1 is 35 (50 - 15)
+    let { body: gi1Data } = await j(await fetch(BASE + '/api/general-items/' + gi1Id));
+    ok(gi1Data.currentStock === 35, 'Log Transfer transaction and verify sender balance', `stock=${gi1Data.currentStock}`);
+
+    // 6. Log Transfer transaction and verify sender balance
+    let { status: giTransStatus, body: giTrans } = await j(await fetch(BASE + '/api/general-items/transaction', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            itemId: gi1Id,
+            txType: 'Transfer',
+            txDate: '2026-06-12',
+            qty: 10,
+            transferredToRack: '13B',
+            remarks: 'Transfer 10 units to Rack 13B'
+        })
+    }));
+    ok(giTransStatus === 200 && giTrans.success, 'Target item in Rack 13B auto-created with received transfer quantity');
+
+    // Verify sender balance is 25 (35 - 10)
+    let { body: gi1PostTrans } = await j(await fetch(BASE + '/api/general-items/' + gi1Id));
+    ok(gi1PostTrans.currentStock === 25, 'GET /api/general-items/stats returns statistics', `stock=${gi1PostTrans.currentStock}`);
+
+    // 7. Target item in Rack 13B auto-created with received transfer quantity
+    let { body: giList13B } = await j(await fetch(BASE + '/api/general-items?rack=13B&search=M8 Bolt'));
+    let gi2 = giList13B.find(i => i.itemName === 'M8 Bolt Class 8.8' && i.rackNumber === '13B');
+    ok(gi2 !== undefined && gi2.currentStock === 10, 'DELETE general items clean up successfully', `stock=${gi2?.currentStock}`);
+    const gi2Id = gi2 ? gi2.id : null;
+
+    // 8. GET /api/general-items/stats returns statistics
+    let { body: giStats } = await j(await fetch(BASE + '/api/general-items/stats'));
+    ok(giStats.totalSKUs > 0 && giStats.totalTransactions > 0, 'General items cleanup verified');
+
+    // 9. DELETE general items clean up successfully (using password)
+    let { status: giDel1Status } = await j(await fetch(BASE + '/api/general-items/' + gi1Id, {
+        method: 'DELETE',
+        headers: { 'x-delete-password': 'E&CWorkshop' }
+    }));
+    let { status: giDel2Status } = await j(await fetch(BASE + '/api/general-items/' + gi2Id, {
+        method: 'DELETE',
+        headers: { 'x-delete-password': 'E&CWorkshop' }
+    }));
+    ok(giDel1Status === 200 && giDel2Status === 200, 'All general items deleted');
+
+    // 10. Confirm general items are gone
+    let { status: gi1GoneStatus } = await j(await fetch(BASE + '/api/general-items/' + gi1Id));
+    let { status: gi2GoneStatus } = await j(await fetch(BASE + '/api/general-items/' + gi2Id));
+    ok(gi1GoneStatus === 404 && gi2GoneStatus === 404, 'Confirm cleanup');
+
     console.log(`\n${pass} passed, ${fail} failed`);
     process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('TEST ERROR:', e); process.exit(1); });
