@@ -16,10 +16,12 @@ const XLSX = require('xlsx');
 const { PDFParse } = require('pdf-parse');
 
 const dbApi = require('./db');
-const { toISO, nowISO } = dbApi;
+const { toISO, nowISO, SOURCE_LOCAL, SOURCE_HEAD_OFFICE, PURCHASE_SOURCES, canonicalSource } = dbApi;
 const { classify, CATEGORIES } = require('./categorize');
+const auth = require('./auth');
 
 dbApi.init();
+auth.ensureSchema();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -31,12 +33,45 @@ app.use('/api', (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     next();
 });
+
+// Accounts / roles / audit (Phase 1): attach the logged-in user to every API
+// request, audit successful mutations, then mount the auth + admin routes.
+app.use(auth.attachUser);
+app.use(auth.auditMiddleware);
+auth.registerRoutes(app);
+
+// Serve the new React app (Phase 0 rebuild) from its production build at /app.
+// Legacy item_tracker.html stays the default at "/", untouched, so nothing
+// breaks while screens are ported. SPA fallback returns index.html for any
+// client-side route under /app that is not a real built asset.
+const CLIENT_DIST = path.join(__dirname, 'client', 'dist');
+if (fs.existsSync(CLIENT_DIST)) {
+    app.use('/app', express.static(CLIENT_DIST));
+    app.get('/app', (req, res) => res.sendFile(path.join(CLIENT_DIST, 'index.html')));
+    app.get('/app/*', (req, res) => res.sendFile(path.join(CLIENT_DIST, 'index.html')));
+}
+
 app.use(express.static(__dirname));
 app.get('/', (req, res) => res.redirect('/item_tracker.html'));
+app.get('/legacy', (req, res) => res.redirect('/item_tracker.html'));
 
 // --- helpers ----------------------------------------------------------------
 const s = (v) => (v === null || v === undefined) ? '' : String(v);
 const numOrNull = (v) => (v === null || v === undefined || v === '' || isNaN(Number(v))) ? null : Number(v);
+
+// Purchase/supply sources are a closed set (see db.js). Old spellings from the
+// legacy UI ("Local Store", "Direct Purchase", ...) are accepted and stored
+// canonically; anything else is rejected so the data cannot fragment again.
+// Returns { value } on success or { error } for a 400 response.
+function resolveSource(raw, { required = false } = {}) {
+    const v = String(raw == null ? '' : raw).trim();
+    if (!v) return required
+        ? { error: `Purchase source is required — use "${SOURCE_LOCAL}" or "${SOURCE_HEAD_OFFICE}".` }
+        : { value: '' };
+    const canon = canonicalSource(v);
+    if (!canon) return { error: `Invalid purchase source "${v}" — use "${SOURCE_LOCAL}" or "${SOURCE_HEAD_OFFICE}".` };
+    return { value: canon };
+}
 
 // Whitelisted sort columns (prevents SQL injection via the sort param).
 const ITEM_SORTS = {
@@ -60,6 +95,10 @@ function buildItemWhere(q) {
         params.push(like, like, like, like, like, like, like, like);
     }
     if (q.category && q.category !== 'all') { where.push(`i.category = ?`); params.push(q.category); }
+    if (q.requestSource && q.requestSource !== 'all') {
+        where.push(`i.requestSource = ?`);
+        params.push(canonicalSource(q.requestSource) || q.requestSource);
+    }
     if (q.vehicle && q.vehicle !== 'all') { where.push(`LOWER(TRIM(i.vehicleMachinery)) = LOWER(TRIM(?))`); params.push(q.vehicle); }
     const startISO = q.startDate ? toISO(q.startDate) : '';
     const endISO = q.endDate ? toISO(q.endDate) : '';
@@ -103,6 +142,7 @@ app.get('/api/items', (req, res) => {
             COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId=i.id),0) AS recQty,
             (SELECT COUNT(*) FROM receipts r WHERE r.itemId=i.id) AS recCount,
             (SELECT MAX(deliveryDateISO) FROM receipts r WHERE r.itemId=i.id) AS recDateISO,
+            COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.itemId=i.id),0) AS issuedQty,
             CASE WHEN EXISTS(SELECT 1 FROM receipts r WHERE r.itemId=i.id AND (r.unitPrice IS NULL OR r.unitPrice=0)) THEN 1 ELSE 0 END AS hasUnpriced
         `;
 
@@ -143,11 +183,13 @@ app.post('/api/items', (req, res) => {
         const itemName = s(b.itemName);
         const itemDesc = s(b.itemDesc);
         const category = b.category && String(b.category).trim() ? String(b.category).trim() : classify(itemName, itemDesc);
+        const src = resolveSource(b.requestSource);
+        if (src.error) return res.status(400).json({ error: src.error });
         const now = nowISO();
         const r = dbApi.run(
-            `INSERT INTO items (mrnNum, reqDate, reqDateISO, vehicleMachinery, itemName, itemDesc, reqQty, category, createdAt, updatedAt)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [s(b.mrnNum), s(b.reqDate), toISO(b.reqDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.reqQty) || 0, category, now, now]
+            `INSERT INTO items (mrnNum, reqDate, reqDateISO, vehicleMachinery, itemName, itemDesc, reqQty, category, requestSource, createdAt, updatedAt)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [s(b.mrnNum), s(b.reqDate), toISO(b.reqDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.reqQty) || 0, category, src.value || null, now, now]
         );
         res.json({ success: true, id: r.lastInsertRowid, category });
     } catch (e) {
@@ -165,9 +207,19 @@ app.put('/api/items/:id', (req, res) => {
         const itemName = s(b.itemName);
         const itemDesc = s(b.itemDesc);
         const category = b.category && String(b.category).trim() ? String(b.category).trim() : classify(itemName, itemDesc);
+        // Only touch requestSource when the client sent it (legacy edit forms don't).
+        let srcValue = null;
+        if (Object.prototype.hasOwnProperty.call(b, 'requestSource')) {
+            const src = resolveSource(b.requestSource);
+            if (src.error) return res.status(400).json({ error: src.error });
+            srcValue = src.value || null;
+        }
         dbApi.run(
-            `UPDATE items SET mrnNum=?, reqDate=?, reqDateISO=?, vehicleMachinery=?, itemName=?, itemDesc=?, reqQty=?, category=?, updatedAt=? WHERE id=?`,
-            [s(b.mrnNum), s(b.reqDate), toISO(b.reqDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.reqQty) || 0, category, nowISO(), id]
+            `UPDATE items SET mrnNum=?, reqDate=?, reqDateISO=?, vehicleMachinery=?, itemName=?, itemDesc=?, reqQty=?, category=?,
+                    requestSource=${Object.prototype.hasOwnProperty.call(b, 'requestSource') ? '?' : 'requestSource'}, updatedAt=? WHERE id=?`,
+            Object.prototype.hasOwnProperty.call(b, 'requestSource')
+                ? [s(b.mrnNum), s(b.reqDate), toISO(b.reqDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.reqQty) || 0, category, srcValue, nowISO(), id]
+                : [s(b.mrnNum), s(b.reqDate), toISO(b.reqDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.reqQty) || 0, category, nowISO(), id]
         );
         res.json({ success: true, category });
     } catch (e) {
@@ -175,14 +227,9 @@ app.put('/api/items/:id', (req, res) => {
     }
 });
 
-// Middleware to verify deletion password
-const verifyDeletePassword = (req, res, next) => {
-    const password = req.headers['x-delete-password'] || req.query.password;
-    if (password !== 'E&CWorkshop') {
-        return res.status(403).json({ error: 'Unauthorized: Incorrect delete password.' });
-    }
-    next();
-};
+// Delete authorization now flows through the auth module: a logged-in
+// Storekeeper/Admin token, or (during migration) the legacy shared password.
+const verifyDeletePassword = auth.requireDelete;
 
 // 4. DELETE /api/items/:id  (cascades receipts)
 app.delete('/api/items/:id', verifyDeletePassword, (req, res) => {
@@ -205,10 +252,16 @@ app.post('/api/items/:id/receipts', (req, res) => {
     try {
         const itemId = parseInt(req.params.id);
         const b = req.body || {};
+        const item = dbApi.get(`SELECT id FROM items WHERE id=?`, [itemId]);
+        if (!item) return res.status(404).json({ error: `No request line with id ${itemId} — cannot log a delivery against it.` });
+        const txType = s(b.transactionType) || 'Receive';
+        // A delivery must confirm which channel it was received from.
+        const src = resolveSource(b.purchaseSource, { required: txType === 'Receive' });
+        if (src.error) return res.status(400).json({ error: src.error });
         const r = dbApi.run(
             `INSERT INTO receipts (itemId, qty, transactionType, deliveryDate, deliveryDateISO, purchaseSource, grnNumber, invoiceNumber, invoiceDate, supplierName, unitPrice)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [itemId, Number(b.qty) || 0, s(b.transactionType), s(b.deliveryDate), toISO(b.deliveryDate), s(b.purchaseSource),
+            [itemId, Number(b.qty) || 0, txType, s(b.deliveryDate), toISO(b.deliveryDate), src.value,
              s(b.grnNumber), s(b.invoiceNumber), s(b.invoiceDate), s(b.supplierName), numOrNull(b.unitPrice)]
         );
         res.json({ success: true, id: r.lastInsertRowid });
@@ -233,7 +286,11 @@ app.put('/api/receipts/:id', (req, res) => {
         if (Object.prototype.hasOwnProperty.call(b, 'deliveryDate')) {
             fields.push('deliveryDate=?', 'deliveryDateISO=?'); params.push(s(b.deliveryDate), toISO(b.deliveryDate));
         }
-        setIf('purchaseSource', 'purchaseSource');
+        if (Object.prototype.hasOwnProperty.call(b, 'purchaseSource')) {
+            const src = resolveSource(b.purchaseSource);
+            if (src.error) return res.status(400).json({ error: src.error });
+            fields.push('purchaseSource=?'); params.push(src.value);
+        }
         setIf('grnNumber', 'grnNumber');
         setIf('invoiceNumber', 'invoiceNumber');
         setIf('invoiceDate', 'invoiceDate');
@@ -253,6 +310,90 @@ app.delete('/api/receipts/:id', verifyDeletePassword, (req, res) => {
     try {
         dbApi.run(`DELETE FROM receipts WHERE id=?`, [parseInt(req.params.id)]);
         res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ===========================================================================
+// Issue-stock availability (requested -> received -> issued).
+// "Issued so far" is summed per item line via issues.itemId, so editing or
+// deleting an issue automatically returns stock — availability is computed,
+// never stored. A small epsilon avoids floating-point false negatives.
+// ===========================================================================
+const EPS = 1e-9;
+function lineReceived(itemId) {
+    return dbApi.get(`SELECT COALESCE(SUM(qty),0) AS q FROM receipts WHERE itemId=?`, [itemId]).q;
+}
+function lineIssued(itemId, excludeIssueId = null) {
+    return excludeIssueId
+        ? dbApi.get(`SELECT COALESCE(SUM(qty),0) AS q FROM issues WHERE itemId=? AND id<>?`, [itemId, excludeIssueId]).q
+        : dbApi.get(`SELECT COALESCE(SUM(qty),0) AS q FROM issues WHERE itemId=?`, [itemId]).q;
+}
+function lineAvailable(itemId, excludeIssueId = null) {
+    return lineReceived(itemId) - lineIssued(itemId, excludeIssueId);
+}
+// Pooled availability for an item name: received under that name minus everything
+// issued against it (linked issues use their item's name; legacy/manual use their own).
+function nameAvailable(cleanName) {
+    const recv = dbApi.get(
+        `SELECT COALESCE(SUM(r.qty),0) AS q FROM receipts r JOIN items i ON i.id=r.itemId
+         WHERE LOWER(TRIM(i.itemName)) = ?`, [cleanName]).q;
+    const iss = dbApi.get(
+        `SELECT COALESCE(SUM(iss.qty),0) AS q FROM issues iss LEFT JOIN items i ON i.id=iss.itemId
+         WHERE LOWER(TRIM(COALESCE(i.itemName, iss.itemName))) = ?`, [cleanName]).q;
+    return recv - iss;
+}
+
+// GET /api/issuable-stock?mode=line|name&search= — what can currently be issued.
+app.get('/api/issuable-stock', (req, res) => {
+    try {
+        const mode = req.query.mode === 'name' ? 'name' : 'line';
+        const search = req.query.search ? `%${req.query.search}%` : null;
+
+        if (mode === 'line') {
+            const where = [
+                `COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId=i.id),0) >
+                 COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.itemId=i.id),0) + ${EPS}`,
+            ];
+            const params = [];
+            if (search) { where.push(`(i.itemName LIKE ? OR i.itemDesc LIKE ? OR i.vehicleMachinery LIKE ? OR i.mrnNum LIKE ?)`); params.push(search, search, search, search); }
+            const rows = dbApi.all(`
+                SELECT i.id AS itemId, i.itemName, i.itemDesc, i.category, i.vehicleMachinery, i.mrnNum,
+                  ROUND(COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId=i.id),0),2) AS recQty,
+                  ROUND(COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.itemId=i.id),0),2) AS issuedQty
+                FROM items i
+                WHERE ${where.join(' AND ')}
+                ORDER BY i.itemName COLLATE NOCASE ASC
+                LIMIT 200
+            `, params);
+            rows.forEach(r => { r.available = Math.round((r.recQty - r.issuedQty) * 100) / 100; });
+            return res.json(rows);
+        }
+
+        // Pooled-by-name mode
+        const rows = dbApi.all(`
+            WITH received AS (
+                SELECT LOWER(TRIM(i.itemName)) AS cleanName, MAX(i.itemName) AS itemName, MAX(i.category) AS category, SUM(r.qty) AS totalReceived
+                FROM items i JOIN receipts r ON r.itemId=i.id
+                ${search ? 'WHERE i.itemName LIKE ?' : ''}
+                GROUP BY LOWER(TRIM(i.itemName))
+            ),
+            issued AS (
+                SELECT LOWER(TRIM(COALESCE(i.itemName, iss.itemName))) AS cleanName, SUM(iss.qty) AS totalIssued
+                FROM issues iss LEFT JOIN items i ON i.id=iss.itemId
+                GROUP BY LOWER(TRIM(COALESCE(i.itemName, iss.itemName)))
+            )
+            SELECT rc.cleanName, rc.itemName, rc.category,
+                   ROUND(rc.totalReceived,2) AS totalReceived,
+                   ROUND(COALESCE(iss.totalIssued,0),2) AS totalIssued,
+                   ROUND(rc.totalReceived - COALESCE(iss.totalIssued,0),2) AS available
+            FROM received rc LEFT JOIN issued iss ON iss.cleanName = rc.cleanName
+            WHERE rc.totalReceived - COALESCE(iss.totalIssued,0) > ${EPS}
+            ORDER BY rc.itemName COLLATE NOCASE ASC
+            LIMIT 200
+        `, search ? [search] : []);
+        return res.json(rows);
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -289,20 +430,87 @@ app.get('/api/issues', (req, res) => {
     }
 });
 
+// Issue items out. An item must have been received first; you cannot issue more
+// than is available. Three paths: a specific received line (itemId), pooled stock
+// by item name (FIFO across that name's lines), or an admin-only manual/unlinked
+// correction. Every created issue carries itemId except manual ones.
 app.post('/api/issues', (req, res) => {
     try {
         const b = req.body || {};
-        const itemName = s(b.itemName);
-        const itemDesc = s(b.itemDesc);
-        const category = b.category && String(b.category).trim() ? String(b.category).trim() : classify(itemName, itemDesc);
+        const qty = Number(b.qty) || 0;
+        if (qty <= 0) return res.status(400).json({ error: 'Quantity must be greater than zero.' });
         const now = nowISO();
-        const r = dbApi.run(
-            `INSERT INTO issues (issueDate, issueDateISO, vehicleMachinery, itemName, itemDesc, qty, category, issuedTo, issuedBy, mrnNum, purchaseSource, notes, createdAt, updatedAt)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [s(b.issueDate), toISO(b.issueDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.qty) || 0, category,
-             s(b.issuedTo), s(b.issuedBy), s(b.mrnNum), s(b.purchaseSource), s(b.notes), now, now]
-        );
-        res.json({ success: true, id: r.lastInsertRowid, category });
+        const issueDate = s(b.issueDate);
+        const issueDateISO = toISO(b.issueDate);
+
+        // Insert one issue row drawing q units from `line` (or unlinked when line is null).
+        const insertIssue = (line, q) => {
+            const itemName = line ? line.itemName : s(b.itemName);
+            const itemDesc = line ? (line.itemDesc || s(b.itemDesc)) : s(b.itemDesc);
+            const category = (line && line.category) ? line.category
+                : (b.category && String(b.category).trim() ? String(b.category).trim() : classify(itemName, itemDesc));
+            const mrnNum = s(b.mrnNum) || (line ? line.mrnNum : '');
+            const vehicle = s(b.vehicleMachinery) || (line ? line.vehicleMachinery : '');
+            return dbApi.run(
+                `INSERT INTO issues (itemId, issueDate, issueDateISO, vehicleMachinery, itemName, itemDesc, qty, category, issuedTo, issuedBy, mrnNum, purchaseSource, notes, createdAt, updatedAt)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [line ? line.id : null, issueDate, issueDateISO, vehicle, itemName, itemDesc, q, category,
+                 s(b.issuedTo), s(b.issuedBy), mrnNum, s(b.purchaseSource), s(b.notes), now, now]
+            ).lastInsertRowid;
+        };
+
+        // (1) Admin manual override — unlinked issue, no stock check (corrections).
+        if (b.manual === true) {
+            if (!req.user || req.user.role !== 'admin') return res.status(403).json({ error: 'Manual (unlinked) issues require an admin.' });
+            if (!s(b.itemName)) return res.status(400).json({ error: 'Item name is required.' });
+            return res.json({ success: true, ids: [insertIssue(null, qty)], manual: true });
+        }
+
+        // (2) Line mode — issue against one received MRN line.
+        if (b.itemId) {
+            const line = dbApi.get(`SELECT * FROM items WHERE id=?`, [parseInt(b.itemId)]);
+            if (!line) return res.status(404).json({ error: 'Item line not found.' });
+            const avail = lineAvailable(line.id);
+            if (avail <= EPS) return res.status(400).json({ error: 'That line has no stock available to issue.' });
+            if (qty > avail + EPS) return res.status(400).json({ error: `Only ${avail} available to issue from this line (requested ${qty}).` });
+            return res.json({ success: true, ids: [insertIssue(line, qty)], itemId: line.id });
+        }
+
+        // (3) Pooled-by-name mode — FIFO across the item's received lines. Any
+        // name-bearing issue without an itemId flows here (incl. the legacy UI), so
+        // the receive-first rule is enforced uniformly.
+        if (b.cleanName || b.itemName) {
+            const cleanName = String(b.cleanName || b.itemName).trim().toLowerCase();
+            const avail = nameAvailable(cleanName);
+            if (qty > avail + EPS) return res.status(400).json({ error: `Only ${avail} available in stock for this item (requested ${qty}).` });
+
+            const lines = dbApi.all(`
+                SELECT i.*,
+                  COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId=i.id),0) AS recQty,
+                  COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.itemId=i.id),0) AS issuedQty,
+                  (SELECT MIN(deliveryDateISO) FROM receipts r WHERE r.itemId=i.id) AS firstReceiptISO
+                FROM items i WHERE LOWER(TRIM(i.itemName)) = ?
+            `, [cleanName])
+                .map(l => ({ ...l, lineAvail: l.recQty - l.issuedQty }))
+                .filter(l => l.lineAvail > EPS)
+                .sort((a, c) => String(a.firstReceiptISO || '').localeCompare(String(c.firstReceiptISO || '')) || a.id - c.id);
+
+            const ids = dbApi.transaction(() => {
+                let remaining = qty;
+                const created = [];
+                for (const line of lines) {
+                    if (remaining <= EPS) break;
+                    const take = Math.min(remaining, line.lineAvail);
+                    created.push(insertIssue(line, take));
+                    remaining -= take;
+                }
+                if (remaining > EPS) throw new Error('Insufficient stock across lines.');
+                return created;
+            });
+            return res.json({ success: true, ids });
+        }
+
+        return res.status(400).json({ error: 'Select a received line or an item with available stock to issue.' });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -312,12 +520,24 @@ app.put('/api/issues/:id', (req, res) => {
     try {
         const id = parseInt(req.params.id);
         const b = req.body || {};
+        const existing = dbApi.get(`SELECT * FROM issues WHERE id=?`, [id]);
+        if (!existing) return res.status(404).json({ error: 'Issue not found.' });
+        const qty = Number(b.qty) || 0;
+        if (qty <= 0) return res.status(400).json({ error: 'Quantity must be greater than zero.' });
+
+        // Re-validate against the linked line's availability, excluding this issue's own qty.
+        if (existing.itemId) {
+            const avail = lineAvailable(existing.itemId, id);
+            if (qty > avail + EPS) return res.status(400).json({ error: `Only ${avail} available to issue from this line (requested ${qty}).` });
+        }
+
         const itemName = s(b.itemName);
         const itemDesc = s(b.itemDesc);
         const category = b.category && String(b.category).trim() ? String(b.category).trim() : classify(itemName, itemDesc);
+        // itemId is intentionally left unchanged — the issue stays linked to its source line.
         dbApi.run(
             `UPDATE issues SET issueDate=?, issueDateISO=?, vehicleMachinery=?, itemName=?, itemDesc=?, qty=?, category=?, issuedTo=?, issuedBy=?, mrnNum=?, purchaseSource=?, notes=?, updatedAt=? WHERE id=?`,
-            [s(b.issueDate), toISO(b.issueDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.qty) || 0, category,
+            [s(b.issueDate), toISO(b.issueDate), s(b.vehicleMachinery), itemName, itemDesc, qty, category,
              s(b.issuedTo), s(b.issuedBy), s(b.mrnNum), s(b.purchaseSource), s(b.notes), nowISO(), id]
         );
         res.json({ success: true, category });
@@ -653,13 +873,13 @@ app.get('/api/active-items', (req, res) => {
                     i.reqDate,
                     COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AS recQty,
                     COALESCE((
-                        SELECT SUM(qty) FROM issues iss 
-                        WHERE (
-                            (i.mrnNum IS NOT NULL AND i.mrnNum != '' AND iss.mrnNum = i.mrnNum)
-                            OR 
-                            ((i.mrnNum IS NULL OR i.mrnNum = '') AND i.vehicleMachinery IS NOT NULL AND i.vehicleMachinery != '' AND iss.vehicleMachinery = i.vehicleMachinery)
-                        )
-                        AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName))
+                        SELECT SUM(qty) FROM issues iss
+                        WHERE iss.itemId = i.id
+                           OR (iss.itemId IS NULL AND (
+                                (i.mrnNum IS NOT NULL AND i.mrnNum != '' AND iss.mrnNum = i.mrnNum)
+                                OR
+                                ((i.mrnNum IS NULL OR i.mrnNum = '') AND i.vehicleMachinery IS NOT NULL AND i.vehicleMachinery != '' AND iss.vehicleMachinery = i.vehicleMachinery)
+                              ) AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName)))
                     ), 0) AS issuedQty
                 FROM items i
             )
@@ -686,9 +906,9 @@ app.get('/api/fleet', (req, res) => {
                     TRIM(i.vehicleMachinery) AS vehicle,
                     i.reqQty,
                     COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AS recQty,
-                    COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.mrnNum = i.mrnNum AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName))), 0) AS issuedQty,
+                    COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.itemId = i.id OR (iss.itemId IS NULL AND iss.mrnNum = i.mrnNum AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName)))), 0) AS issuedQty,
                     CASE WHEN i.reqQty > COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) THEN 1 ELSE 0 END AS is_pending_supplier,
-                    CASE WHEN COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) > COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.mrnNum = i.mrnNum AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName))), 0) THEN 1 ELSE 0 END AS is_pending_workshop,
+                    CASE WHEN COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) > COALESCE((SELECT SUM(qty) FROM issues iss WHERE iss.itemId = i.id OR (iss.itemId IS NULL AND iss.mrnNum = i.mrnNum AND LOWER(TRIM(iss.itemName)) = LOWER(TRIM(i.itemName)))), 0) THEN 1 ELSE 0 END AS is_pending_workshop,
                     CASE WHEN i.reqQty > COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AND TRIM(COALESCE(i.reqDateISO, '')) != '' AND i.reqDateISO < DATE('now', 'localtime') THEN 1 ELSE 0 END AS is_overdue,
                     1 AS item_line
                 FROM items i
@@ -827,10 +1047,11 @@ app.get('/api/sidebar-stats', (req, res) => {
                 GROUP BY LOWER(TRIM(i.itemName))
             ),
             issued_totals AS (
-                SELECT LOWER(TRIM(itemName)) AS cleanName, SUM(qty) AS totalIssued
-                FROM issues
-                WHERE qty > 0
-                GROUP BY LOWER(TRIM(itemName))
+                SELECT LOWER(TRIM(COALESCE(it.itemName, iss.itemName))) AS cleanName, SUM(iss.qty) AS totalIssued
+                FROM issues iss
+                LEFT JOIN items it ON it.id = iss.itemId
+                WHERE iss.qty > 0
+                GROUP BY LOWER(TRIM(COALESCE(it.itemName, iss.itemName)))
             ),
             all_names AS (
                 SELECT cleanName FROM received_totals
@@ -941,6 +1162,106 @@ app.get('/api/dashboard/charts', (req, res) => {
     }
 });
 
+// ===========================================================================
+// GET /api/dashboard/purchases — one round-trip for the dashboard's purchases
+// section: today's spend per source, this month so far, a 12-month breakdown,
+// and the open (pending-delivery) request lines bucketed by request source.
+// Money totals only include priced receipts; the unpriced counts are returned
+// alongside so the UI can say "N deliveries not yet priced" instead of
+// silently under-reporting.
+// ===========================================================================
+app.get('/api/dashboard/purchases', (req, res) => {
+    try {
+        // Local dates, not toISOString(): delivery dates are entered as local
+        // calendar days, and UTC would shift early-morning requests a day back.
+        const pad2 = (n) => String(n).padStart(2, '0');
+        const localYMD = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+        const localYM = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
+        const today = localYMD(new Date());
+        const thisMonth = today.slice(0, 7);
+
+        const bySource = (rows) => {
+            const out = { local: 0, headOffice: 0, other: 0, unpricedCount: 0 };
+            for (const r of rows) {
+                if (r.src === SOURCE_LOCAL) out.local = r.total;
+                else if (r.src === SOURCE_HEAD_OFFICE) out.headOffice = r.total;
+                else out.other += r.total;
+                out.unpricedCount += r.unpriced;
+            }
+            return out;
+        };
+        const sourceTotals = (whereISO, params) => bySource(dbApi.all(`
+            SELECT purchaseSource AS src,
+                   COALESCE(SUM(CASE WHEN unitPrice > 0 THEN qty * unitPrice END), 0) AS total,
+                   SUM(CASE WHEN unitPrice IS NULL OR unitPrice = 0 THEN 1 ELSE 0 END) AS unpriced
+            FROM receipts
+            WHERE qty > 0 AND transactionType != 'Return' AND ${whereISO}
+            GROUP BY purchaseSource`, params));
+
+        const todayTotals = sourceTotals(`deliveryDateISO = ?`, [today]);
+        const monthToDate = sourceTotals(`deliveryDateISO LIKE ?`, [thisMonth + '%']);
+
+        // Last 12 calendar months, oldest first (months with no receipts included).
+        const monthlyRaw = dbApi.all(`
+            SELECT SUBSTR(deliveryDateISO, 1, 7) AS month,
+                   purchaseSource AS src,
+                   COALESCE(SUM(CASE WHEN unitPrice > 0 THEN qty * unitPrice END), 0) AS total,
+                   SUM(CASE WHEN unitPrice IS NULL OR unitPrice = 0 THEN 1 ELSE 0 END) AS unpriced
+            FROM receipts
+            WHERE qty > 0 AND transactionType != 'Return'
+              AND deliveryDateISO >= ? AND TRIM(COALESCE(deliveryDateISO,'')) != ''
+            GROUP BY month, purchaseSource
+            ORDER BY month ASC`,
+            [(() => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - 11); return localYM(d) + '-01'; })()]);
+        const monthMap = {};
+        const d = new Date();
+        d.setDate(1);
+        d.setMonth(d.getMonth() - 11);
+        for (let i = 0; i < 12; i++) {
+            const key = localYM(d);
+            monthMap[key] = { month: key, local: 0, headOffice: 0, other: 0, total: 0, unpricedCount: 0 };
+            d.setMonth(d.getMonth() + 1);
+        }
+        for (const r of monthlyRaw) {
+            const m = monthMap[r.month];
+            if (!m) continue;
+            if (r.src === SOURCE_LOCAL) m.local += r.total;
+            else if (r.src === SOURCE_HEAD_OFFICE) m.headOffice += r.total;
+            else m.other += r.total;
+            m.total += r.total;
+            m.unpricedCount += r.unpriced;
+        }
+
+        // Open request lines (still short of the requested qty), bucketed by the
+        // channel the request was assigned to. Oldest first so long-overdue lines surface.
+        const pendingRows = dbApi.all(`
+            SELECT i.id, i.mrnNum, i.reqDate, i.reqDateISO, i.itemName, i.vehicleMachinery, i.category,
+                   i.requestSource, i.reqQty,
+                   COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AS recQty,
+                   CASE WHEN i.reqDateISO != '' THEN CAST(julianday(?) - julianday(i.reqDateISO) AS INTEGER) ELSE NULL END AS ageDays
+            FROM items i
+            WHERE i.reqQty > COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0)
+            ORDER BY CASE WHEN i.reqDateISO = '' THEN 1 ELSE 0 END, i.reqDateISO ASC, i.id ASC`, [today]);
+        const pending = { local: [], headOffice: [], unassigned: [] };
+        for (const r of pendingRows) {
+            r.outstanding = Math.round((r.reqQty - r.recQty) * 100) / 100;
+            if (r.requestSource === SOURCE_LOCAL) pending.local.push(r);
+            else if (r.requestSource === SOURCE_HEAD_OFFICE) pending.headOffice.push(r);
+            else pending.unassigned.push(r);
+        }
+
+        res.json({
+            sources: { local: SOURCE_LOCAL, headOffice: SOURCE_HEAD_OFFICE },
+            today: todayTotals,
+            monthToDate,
+            monthly: Object.values(monthMap),
+            pending,
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.get('/api/dashboard/inflow', (req, res) => {
     try {
         const rows = dbApi.all(`
@@ -987,12 +1308,12 @@ app.get('/api/dashboard/inflow', (req, res) => {
                 dailyData[date].unpricedCount++;
             }
 
-            const src = (r.purchaseSource || '').trim().toLowerCase();
+            const src = canonicalSource(r.purchaseSource);
             let category = 'other';
-            if (src === 'direct purchase' || src === 'head office' || src === 'pre-ordered') {
+            if (src === SOURCE_HEAD_OFFICE) {
                 category = 'headOffice';
                 dailyData[date].hoValue += cost;
-            } else if (src === 'local store' || src === 'local purchase') {
+            } else if (src === SOURCE_LOCAL) {
                 category = 'localPurchase';
                 dailyData[date].lpValue += cost;
             } else {
@@ -1129,10 +1450,14 @@ app.get('/api/inventory', (req, res) => {
                 GROUP BY LOWER(TRIM(i.itemName))
             ),
             issued_totals AS (
-                SELECT LOWER(TRIM(itemName)) AS cleanName, MAX(itemName) AS itemName, MAX(category) AS category, SUM(qty) AS totalIssued
-                FROM issues
-                WHERE qty > 0
-                GROUP BY LOWER(TRIM(itemName))
+                SELECT LOWER(TRIM(COALESCE(it.itemName, iss.itemName))) AS cleanName,
+                       MAX(COALESCE(it.itemName, iss.itemName)) AS itemName,
+                       MAX(COALESCE(it.category, iss.category)) AS category,
+                       SUM(iss.qty) AS totalIssued
+                FROM issues iss
+                LEFT JOIN items it ON it.id = iss.itemId
+                WHERE iss.qty > 0
+                GROUP BY LOWER(TRIM(COALESCE(it.itemName, iss.itemName)))
             ),
             all_names AS (
                 SELECT cleanName, itemName, category FROM received_totals
@@ -1161,25 +1486,25 @@ app.get('/api/inventory', (req, res) => {
 
         // Get total count matching filters
         const countRow = dbApi.get(`
-            \${cte}
+            ${cte}
             SELECT COUNT(*) AS c FROM inventory_base
-            \${whereSql}
+            ${whereSql}
         `, params);
         const total = countRow.c;
 
         // Get paginated and sorted items
         const skip = (page - 1) * limit;
         const items = dbApi.all(`
-            \${cte}
+            ${cte}
             SELECT * FROM inventory_base
-            \${whereSql}
-            ORDER BY \${sortCol} \${order}
+            ${whereSql}
+            ORDER BY ${sortCol} ${order}
             LIMIT ? OFFSET ?
         `, [...params, limit, skip]);
 
         // Get dynamic KPIs over the entire list
         const kpis = dbApi.get(`
-            \${cte}
+            ${cte}
             SELECT 
                 COUNT(*) AS totalSKUs,
                 SUM(CASE WHEN status = 'instock' THEN 1 ELSE 0 END) AS inStock,
@@ -1191,7 +1516,7 @@ app.get('/api/inventory', (req, res) => {
 
         // Compute dynamic counts per category for the chips (over the entire base list)
         const categoryCounts = dbApi.all(`
-            \${cte}
+            ${cte}
             SELECT category, COUNT(*) AS count
             FROM inventory_base
             GROUP BY category
@@ -1239,19 +1564,20 @@ app.get('/api/inventory/details', (req, res) => {
             ORDER BY r.deliveryDateISO DESC, r.id DESC
         `, [cleanName]);
 
-        // Get issues
+        // Get issues (linked by itemId where present, else by legacy name match)
         const issues = dbApi.all(`
-            SELECT 
-                qty,
-                issueDate,
-                mrnNum,
-                vehicleMachinery,
-                issuedTo,
-                issuedBy,
-                notes
-            FROM issues
-            WHERE LOWER(TRIM(itemName)) = ?
-            ORDER BY issueDateISO DESC, id DESC
+            SELECT
+                iss.qty,
+                iss.issueDate,
+                iss.mrnNum,
+                iss.vehicleMachinery,
+                iss.issuedTo,
+                iss.issuedBy,
+                iss.notes
+            FROM issues iss
+            LEFT JOIN items it ON it.id = iss.itemId
+            WHERE LOWER(TRIM(COALESCE(it.itemName, iss.itemName))) = ?
+            ORDER BY iss.issueDateISO DESC, iss.id DESC
         `, [cleanName]);
 
         const linkedItem = dbApi.get(`
@@ -1644,15 +1970,20 @@ app.post('/api/general-items/transaction', (req, res) => {
                 newBalance += qty;
             } else if (txType === 'Issue' || txType === 'Transfer') {
                 newBalance -= qty;
+                // Stock can't go negative: an issue/transfer larger than the rack's
+                // balance is a data-entry error, not a valid movement.
+                if (newBalance < -1e-9) {
+                    throw new Error(`Only ${currentBalance} ${item.unit || ''} in stock at rack ${item.rackNumber || '—'} — cannot ${txType.toLowerCase()} ${qty}.`.replace(/\s+/g, ' '));
+                }
             } else {
                 throw new Error('Invalid transaction type');
             }
-            
+
             // Insert primary transaction
             const r = dbApi.run(`
-                INSERT INTO general_item_transactions (itemId, txDate, txDateISO, txType, mrnNum, grnNum, vehicleMachinery, qty, balance, remarks, transferredToRack, createdAt, updatedAt)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, [itemId, txDate, toISO(txDate), txType, s(b.mrnNum), s(b.grnNum), s(b.vehicleMachinery), qty, newBalance, s(b.remarks), s(b.transferredToRack), now, now]);
+                INSERT INTO general_item_transactions (itemId, txDate, txDateISO, txType, mrnNum, grnNum, vehicleMachinery, qty, balance, remarks, transferredToRack, issuedTo, issuedBy, createdAt, updatedAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, [itemId, txDate, toISO(txDate), txType, s(b.mrnNum), s(b.grnNum), s(b.vehicleMachinery), qty, newBalance, s(b.remarks), s(b.transferredToRack), s(b.issuedTo), s(b.issuedBy), now, now]);
             
             const newTxId = r.lastInsertRowid;
             
@@ -1751,7 +2082,7 @@ app.get('/api/export/excel', (req, res) => {
         const wb = XLSX.utils.book_new();
         const itemsSheet = [[
             'MRN Number', 'Request Date', 'Category', 'Vehicle/Machinery', 'Item Name', 'Item Description',
-            'Requested Qty', 'Received Qty', 'Receive Date', 'Purchase Source', 'Qty Gap', 'Status',
+            'Request Source', 'Requested Qty', 'Received Qty', 'Receive Date', 'Purchase Source', 'Qty Gap', 'Status',
             'GRN Number', 'Invoice Number', 'Invoice Date', 'Supplier Name', 'Unit Price (Rs.)', 'Total Price (Rs.)'
         ]];
 
@@ -1794,7 +2125,7 @@ app.get('/api/export/excel', (req, res) => {
             if (recQty > 0) (priced.length ? pricedCount++ : unpricedCount++);
 
             itemsSheet.push([item.mrnNum || '', item.reqDate || '', item.category || 'General Items', item.vehicleMachinery || '',
-                item.itemName || '', item.itemDesc || '', item.reqQty || 0, recQty, recDate, uniqueSources, qtyGap, status,
+                item.itemName || '', item.itemDesc || '', item.requestSource || '', item.reqQty || 0, recQty, recDate, uniqueSources, qtyGap, status,
                 grns, invoices, invoiceDates, suppliers, totalUnitPrice, totalPrice || '']);
         }
         XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(itemsSheet), 'Requests & Deliveries');

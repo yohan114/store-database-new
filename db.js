@@ -107,6 +107,27 @@ function toISO(dateStr) {
 
 const nowISO = () => new Date().toISOString();
 
+// ---- Canonical purchase / supply sources ------------------------------------
+// Exactly two channels exist: bought locally, or supplied by head office.
+// Historical data held 7+ spellings ("Local Store", "Direct Purchase",
+// "Head Office", ...) which broke source-based reporting; init() collapses
+// them once and the API only accepts these values afterwards.
+const SOURCE_LOCAL = 'Local Purchase';
+const SOURCE_HEAD_OFFICE = 'Head Office Purchase';
+const PURCHASE_SOURCES = [SOURCE_LOCAL, SOURCE_HEAD_OFFICE];
+
+const LOCAL_ALIASES = ['local store', 'local stores', 'local purchase'];
+const HEAD_OFFICE_ALIASES = ['direct purchase', 'head office', 'headoffice', 'pre-ordered', 'head office purchase', 'headoffice purchase'];
+
+/** Map any historical spelling to a canonical source ('' when unknown/mixed). */
+function canonicalSource(value) {
+    const v = String(value == null ? '' : value).trim().toLowerCase();
+    if (!v) return '';
+    if (LOCAL_ALIASES.includes(v)) return SOURCE_LOCAL;
+    if (HEAD_OFFICE_ALIASES.includes(v)) return SOURCE_HEAD_OFFICE;
+    return '';
+}
+
 // ---- Schema ----------------------------------------------------------------
 function init() {
     exec(`
@@ -141,6 +162,7 @@ function init() {
 
         CREATE TABLE IF NOT EXISTS issues (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            itemId INTEGER,
             issueDate TEXT,
             issueDateISO TEXT,
             vehicleMachinery TEXT,
@@ -292,7 +314,122 @@ function init() {
             exec(`CREATE INDEX IF NOT EXISTS idx_items_category ON items(category);`);
         }
     } catch (e) { /* fresh DB already has it */ }
+
+    // Link issues to the MRN line they draw from (requested -> received -> issued).
+    // Add issues.itemId on older DBs, then one-time backfill of historical issues by
+    // matching (mrnNum, itemName) first, then (vehicleMachinery, itemName). Unmatched
+    // rows stay NULL (legacy) and are never re-touched, so manual issues are preserved.
+    try {
+        const cols = all(`PRAGMA table_info(issues)`);
+        if (!cols.some(c => c.name === 'itemId')) {
+            exec(`ALTER TABLE issues ADD COLUMN itemId INTEGER;`);
+
+            exec(`
+                UPDATE issues
+                SET itemId = (
+                    SELECT i.id FROM items i
+                    WHERE i.mrnNum = issues.mrnNum
+                      AND LOWER(TRIM(i.itemName)) = LOWER(TRIM(issues.itemName))
+                    ORDER BY (SELECT COUNT(*) FROM receipts r WHERE r.itemId = i.id) DESC, i.id ASC
+                    LIMIT 1
+                )
+                WHERE itemId IS NULL
+                  AND mrnNum IS NOT NULL AND TRIM(mrnNum) != ''
+                  AND TRIM(COALESCE(itemName,'')) != ''
+                  AND EXISTS (
+                    SELECT 1 FROM items i2
+                    WHERE i2.mrnNum = issues.mrnNum
+                      AND LOWER(TRIM(i2.itemName)) = LOWER(TRIM(issues.itemName))
+                  );
+            `);
+
+            exec(`
+                UPDATE issues
+                SET itemId = (
+                    SELECT i.id FROM items i
+                    WHERE LOWER(TRIM(i.vehicleMachinery)) = LOWER(TRIM(issues.vehicleMachinery))
+                      AND LOWER(TRIM(i.itemName)) = LOWER(TRIM(issues.itemName))
+                    ORDER BY (SELECT COUNT(*) FROM receipts r WHERE r.itemId = i.id) DESC, i.id ASC
+                    LIMIT 1
+                )
+                WHERE itemId IS NULL
+                  AND TRIM(COALESCE(vehicleMachinery,'')) != ''
+                  AND TRIM(COALESCE(itemName,'')) != ''
+                  AND EXISTS (
+                    SELECT 1 FROM items i2
+                    WHERE LOWER(TRIM(i2.vehicleMachinery)) = LOWER(TRIM(issues.vehicleMachinery))
+                      AND LOWER(TRIM(i2.itemName)) = LOWER(TRIM(issues.itemName))
+                  );
+            `);
+
+            const linked = get(`SELECT COUNT(*) AS c FROM issues WHERE itemId IS NOT NULL`).c;
+            const total = get(`SELECT COUNT(*) AS c FROM issues`).c;
+            console.log(`[migrate] issues.itemId added; linked ${linked}/${total} historical issues to MRN lines.`);
+        }
+        // Ensure the index exists on both fresh and migrated databases.
+        exec(`CREATE INDEX IF NOT EXISTS idx_issues_itemId ON issues(itemId);`);
+    } catch (e) { console.warn('issues.itemId migration warning:', e.message); }
+
+    // Requests carry the channel they should be fulfilled from (Local Purchase /
+    // Head Office Purchase); deliveries then confirm the channel actually used.
+    // One-time on add: normalize historical receipt sources to the two canonical
+    // values and backfill requestSource where an item's receipts are unanimous.
+    // Blank / genuinely mixed historical rows are left untouched (logged below)
+    // so no data is invented; they can be corrected by hand on the Pricing desk.
+    try {
+        const cols = all(`PRAGMA table_info(items)`);
+        if (!cols.some(c => c.name === 'requestSource')) {
+            exec(`ALTER TABLE items ADD COLUMN requestSource TEXT;`);
+
+            run(`UPDATE receipts SET purchaseSource = ?
+                 WHERE LOWER(TRIM(COALESCE(purchaseSource,''))) IN (${LOCAL_ALIASES.map(() => '?').join(',')})
+                   AND purchaseSource <> ?`,
+                [SOURCE_LOCAL, ...LOCAL_ALIASES, SOURCE_LOCAL]);
+            run(`UPDATE receipts SET purchaseSource = ?
+                 WHERE LOWER(TRIM(COALESCE(purchaseSource,''))) IN (${HEAD_OFFICE_ALIASES.map(() => '?').join(',')})
+                   AND purchaseSource <> ?`,
+                [SOURCE_HEAD_OFFICE, ...HEAD_OFFICE_ALIASES, SOURCE_HEAD_OFFICE]);
+
+            const leftover = all(`
+                SELECT COALESCE(NULLIF(TRIM(purchaseSource),''),'(blank)') AS src, COUNT(*) AS c
+                FROM receipts
+                WHERE purchaseSource IS NULL OR TRIM(purchaseSource) = '' OR purchaseSource NOT IN (?, ?)
+                GROUP BY 1`, [SOURCE_LOCAL, SOURCE_HEAD_OFFICE]);
+            if (leftover.length) {
+                console.log('[migrate] receipts.purchaseSource normalized; unresolved values kept as-is:',
+                    leftover.map(r => `${r.src} x${r.c}`).join(', '));
+            } else {
+                console.log('[migrate] receipts.purchaseSource fully normalized.');
+            }
+
+            run(`UPDATE items SET requestSource = (
+                    SELECT MIN(r.purchaseSource) FROM receipts r
+                    WHERE r.itemId = items.id AND r.purchaseSource IN (?, ?)
+                 )
+                 WHERE requestSource IS NULL
+                   AND (SELECT COUNT(DISTINCT r.purchaseSource) FROM receipts r
+                        WHERE r.itemId = items.id AND r.purchaseSource IN (?, ?)) = 1`,
+                [SOURCE_LOCAL, SOURCE_HEAD_OFFICE, SOURCE_LOCAL, SOURCE_HEAD_OFFICE]);
+            const filled = get(`SELECT COUNT(*) AS c FROM items WHERE requestSource IS NOT NULL`).c;
+            console.log(`[migrate] items.requestSource added; backfilled ${filled} items from their receipts.`);
+        }
+        exec(`CREATE INDEX IF NOT EXISTS idx_items_requestSource ON items(requestSource);`);
+    } catch (e) { console.warn('requestSource migration warning:', e.message); }
+
+    // General-item issue accountability: who received the item, who issued it.
+    try {
+        const cols = all(`PRAGMA table_info(general_item_transactions)`);
+        if (!cols.some(c => c.name === 'issuedTo')) {
+            exec(`ALTER TABLE general_item_transactions ADD COLUMN issuedTo TEXT;`);
+            exec(`ALTER TABLE general_item_transactions ADD COLUMN issuedBy TEXT;`);
+            console.log('[migrate] general_item_transactions: added issuedTo / issuedBy.');
+        }
+    } catch (e) { console.warn('general tx issuedTo migration warning:', e.message); }
+
     return db;
 }
 
-module.exports = { db, ENGINE, DB_FILE, init, all, get, run, exec, transaction, toISO, nowISO };
+module.exports = {
+    db, ENGINE, DB_FILE, init, all, get, run, exec, transaction, toISO, nowISO,
+    SOURCE_LOCAL, SOURCE_HEAD_OFFICE, PURCHASE_SOURCES, canonicalSource,
+};
