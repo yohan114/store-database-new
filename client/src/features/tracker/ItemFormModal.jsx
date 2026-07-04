@@ -5,8 +5,9 @@ import Modal from '../../components/ui/Modal.jsx';
 import { useToast } from '../../components/ui/Toast.jsx';
 import { useVehicles, useCategories } from '../../lib/hooks.js';
 import { toDateInput } from '../../lib/format.js';
+import SourceTicks from '../../components/ui/SourceTicks.jsx';
 
-const empty = { mrnNum: '', reqDate: '', vehicleMachinery: '', itemName: '', itemDesc: '', reqQty: '', category: '' };
+const empty = { mrnNum: '', reqDate: '', vehicleMachinery: '', itemName: '', itemDesc: '', reqQty: '', category: '', requestSource: '' };
 
 export default function ItemFormModal({ open, onClose, item }) {
   const editing = !!item;
@@ -28,6 +29,7 @@ export default function ItemFormModal({ open, onClose, item }) {
             itemDesc: item.itemDesc || '',
             reqQty: item.reqQty ?? '',
             category: item.category || '',
+            requestSource: item.requestSource || '',
           }
         : empty
     );
@@ -51,7 +53,9 @@ export default function ItemFormModal({ open, onClose, item }) {
     onError: (e) => toast.error(e.message),
   });
 
-  const canSave = f.itemName.trim() && !save.isPending;
+  // Every new request must say which channel should fulfil it; existing lines
+  // predating the field can still be edited without forcing a choice.
+  const canSave = f.itemName.trim() && (editing ? true : !!f.requestSource) && !save.isPending;
 
   return (
     <Modal
@@ -96,6 +100,9 @@ export default function ItemFormModal({ open, onClose, item }) {
         </Field>
         <Field label="Description" className="sm:col-span-2">
           <input className="input" value={f.itemDesc} onChange={set('itemDesc')} placeholder="optional details / part no." />
+        </Field>
+        <Field label={editing ? 'Request to' : 'Request to *'} className="sm:col-span-2">
+          <SourceTicks name="requestSource" value={f.requestSource} onChange={(v) => setF((p) => ({ ...p, requestSource: v }))} />
         </Field>
         <Field label="Category" className="sm:col-span-2">
           <select className="input" value={f.category} onChange={set('category')}>

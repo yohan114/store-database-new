@@ -25,7 +25,7 @@ export default function GeneralItems() {
   const [category, setCategory] = useState('all');
   const [stockStatus, setStockStatus] = useState('all');
   const [form, setForm] = useState(undefined);
-  const [txItem, setTxItem] = useState(null);
+  const [tx, setTx] = useState(null); // null = closed, {item} = bound, {item:null} = with picker
   const [ledger, setLedger] = useState(null);
 
   const debSearch = useDebounce(search, 300);
@@ -60,7 +60,14 @@ export default function GeneralItems() {
           <h1 className="text-2xl font-bold text-slate-800">General Items &amp; Racks</h1>
           <p className="text-sm text-slate-500">Rack-based stock with a running balance per item.</p>
         </div>
-        {canWrite && <button onClick={() => setForm(null)} className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700">+ Register item</button>}
+        {canWrite && (
+          <div className="flex gap-2">
+            <button onClick={() => setTx({ item: null })} className="rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-2 text-sm font-semibold text-emerald-700 hover:bg-emerald-100">
+              Record movement
+            </button>
+            <button onClick={() => setForm(null)} className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700">+ Register item</button>
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
@@ -117,7 +124,7 @@ export default function GeneralItems() {
                   <td className="px-3 py-2">
                     <div className="flex justify-end gap-1">
                       <button onClick={() => setLedger(it)} className="rounded border border-slate-200 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50">Ledger</button>
-                      {canWrite && <button onClick={() => setTxItem(it)} className="rounded border border-emerald-200 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-50">Move stock</button>}
+                      {canWrite && <button onClick={() => setTx({ item: it })} className="rounded border border-emerald-200 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-50">Move stock</button>}
                       {canWrite && <button onClick={() => setForm(it)} className="rounded border border-slate-200 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50">Edit</button>}
                       {canDelete && <button onClick={() => { if (window.confirm(`Delete "${it.itemName}" and its transactions?`)) del.mutate(it.id); }} className="rounded border border-rose-200 px-2 py-1 text-xs text-rose-600 hover:bg-rose-50">Delete</button>}
                     </div>
@@ -130,7 +137,7 @@ export default function GeneralItems() {
       </div>
 
       <GeneralItemFormModal open={form !== undefined} onClose={() => setForm(undefined)} item={form || null} />
-      <GeneralItemTxModal open={!!txItem} onClose={() => setTxItem(null)} item={txItem} />
+      <GeneralItemTxModal open={!!tx} onClose={() => setTx(null)} item={tx?.item || null} />
       <GeneralItemLedgerModal open={!!ledger} onClose={() => setLedger(null)} itemId={ledger?.id} name={ledger?.itemName} />
     </div>
   );

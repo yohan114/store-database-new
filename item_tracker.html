@@ -416,11 +416,11 @@
                             <div class="flex gap-4 text-xs font-bold text-slate-500">
                                 <div class="flex items-center gap-1.5">
                                     <span class="w-2.5 h-2.5 rounded-full bg-indigo-650 dark:bg-indigo-400"></span>
-                                    <span>Head Office (Direct)</span>
+                                    <span>Head Office Purchase</span>
                                 </div>
                                 <div class="flex items-center gap-1.5">
                                     <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 dark:bg-emerald-450"></span>
-                                    <span>Local Purchase (Store)</span>
+                                    <span>Local Purchase</span>
                                 </div>
                             </div>
                         </div>
@@ -694,16 +694,12 @@
                                 <label class="block text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2">Purchase / Supply Source <span class="text-red-500">*</span></label>
                                 <div class="flex flex-wrap gap-3.5 mt-1.5">
                                     <label class="flex items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-4 py-2.5 rounded-xl text-sm font-semibold cursor-pointer hover:border-indigo-500">
-                                        <input type="radio" name="recDeskPurchaseSource" value="Local Store" required class="text-indigo-650">
-                                        <span>Local Store</span>
+                                        <input type="radio" name="recDeskPurchaseSource" value="Local Purchase" required class="text-indigo-650">
+                                        <span>Local Purchase</span>
                                     </label>
                                     <label class="flex items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-4 py-2.5 rounded-xl text-sm font-semibold cursor-pointer hover:border-indigo-500">
-                                        <input type="radio" name="recDeskPurchaseSource" value="Direct Purchase" class="text-indigo-650">
-                                        <span>Direct Purchase</span>
-                                    </label>
-                                    <label class="flex items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-4 py-2.5 rounded-xl text-sm font-semibold cursor-pointer hover:border-indigo-500">
-                                        <input type="radio" name="recDeskPurchaseSource" value="Pre-Ordered" class="text-indigo-650">
-                                        <span>Pre-Ordered</span>
+                                        <input type="radio" name="recDeskPurchaseSource" value="Head Office Purchase" class="text-indigo-650">
+                                        <span>Head Office Purchase</span>
                                     </label>
                                 </div>
                             </div>
@@ -2016,7 +2012,20 @@
                     <label class="block text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2">Requested Qty <span class="text-red-500">*</span></label>
                     <input type="number" id="reqQty" step="0.01" required min="0.01" placeholder="e.g. 10" class="block w-full rounded-xl border-slate-200 dark:border-slate-800 shadow-sm p-3 border focus:border-indigo-500 focus:ring-indigo-500 outline-none transition text-sm bg-slate-50 dark:bg-slate-900 focus:bg-white dark:focus:bg-slate-950 text-slate-800 dark:text-slate-100">
                 </div>
-                
+                <div class="md:col-span-2">
+                    <label class="block text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2">Request To <span class="text-red-500">*</span></label>
+                    <div class="flex flex-wrap gap-3.5">
+                        <label class="flex items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-4 py-2.5 rounded-xl text-sm font-semibold cursor-pointer hover:border-indigo-500">
+                            <input type="radio" name="addRequestSource" value="Local Purchase" required class="text-indigo-650">
+                            <span>Local Purchase</span>
+                        </label>
+                        <label class="flex items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-4 py-2.5 rounded-xl text-sm font-semibold cursor-pointer hover:border-indigo-500">
+                            <input type="radio" name="addRequestSource" value="Head Office Purchase" class="text-indigo-650">
+                            <span>Head Office Purchase</span>
+                        </label>
+                    </div>
+                </div>
+
                 <div class="md:col-span-2 flex justify-end space-x-3 mt-4 pt-5 border-t border-slate-100 dark:border-slate-800">
                     <button type="button" onclick="closeAddModal()" class="px-5 py-3 bg-slate-100 dark:bg-slate-850 text-slate-700 dark:text-slate-300 font-bold rounded-xl hover:bg-slate-200 dark:hover:bg-slate-800 transition text-sm">Cancel</button>
                     <button type="submit" class="px-6 py-3 bg-indigo-650 hover:bg-indigo-700 text-white font-bold rounded-xl hover:shadow-glow shadow-sm transition text-sm">Submit Request</button>
@@ -2306,6 +2315,19 @@
                         <select id="editReqCategory" class="category-select block w-full rounded-xl border-slate-200 dark:border-slate-800 shadow-sm p-3 border focus:border-indigo-500 focus:ring-indigo-500 outline-none transition text-sm bg-slate-50 dark:bg-slate-900 focus:bg-white dark:focus:bg-slate-950 text-slate-800 dark:text-slate-100 font-semibold">
                             <option value="">Auto-detect from name</option>
                         </select>
+                    </div>
+                    <div class="sm:col-span-2">
+                        <label class="block text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2">Request To</label>
+                        <div class="flex flex-wrap gap-3.5">
+                            <label class="flex items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-4 py-2.5 rounded-xl text-sm font-semibold cursor-pointer hover:border-indigo-500">
+                                <input type="radio" name="editRequestSource" value="Local Purchase" class="text-indigo-650">
+                                <span>Local Purchase</span>
+                            </label>
+                            <label class="flex items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-4 py-2.5 rounded-xl text-sm font-semibold cursor-pointer hover:border-indigo-500">
+                                <input type="radio" name="editRequestSource" value="Head Office Purchase" class="text-indigo-650">
+                                <span>Head Office Purchase</span>
+                            </label>
+                        </div>
                     </div>
                     <div>
                         <label class="block text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2">Requested Qty <span class="text-red-500">*</span></label>
@@ -5540,6 +5562,9 @@
             document.getElementById('editReqDesc').value = item.itemDesc || '';
             document.getElementById('editReqQtyInput').value = item.reqQty || '';
             document.getElementById('editReqCategory').value = item.category || '';
+            document.querySelectorAll('input[name="editRequestSource"]').forEach(el => {
+                el.checked = el.value === (item.requestSource || '');
+            });
             document.getElementById('editReqPassword').value = ''; // Reset password field
 
             modal.classList.remove('hidden');
@@ -5568,8 +5593,11 @@
             const itemDesc = document.getElementById('editReqDesc').value.trim();
             const reqQty = parseFloat(document.getElementById('editReqQtyInput').value);
             const category = document.getElementById('editReqCategory').value;
+            const editSourceEl = document.querySelector('input[name="editRequestSource"]:checked');
 
             const updateData = { mrnNum, reqDate, vehicleMachinery, itemName, itemDesc, reqQty, category };
+            // Legacy rows may predate the field — only send it once a choice is made.
+            if (editSourceEl) updateData.requestSource = editSourceEl.value;
 
             await syncService.enqueue(
                 'UPDATE_ITEM',
@@ -5604,8 +5632,14 @@
             const itemDesc = document.getElementById('itemDesc').value.trim();
             const reqQty = parseFloat(document.getElementById('reqQty').value);
             const category = document.getElementById('itemCategory').value;
+            const requestSourceEl = document.querySelector('input[name="addRequestSource"]:checked');
+            if (!requestSourceEl) {
+                alert('Please select where this request goes (Local Purchase or Head Office Purchase).');
+                return;
+            }
+            const requestSource = requestSourceEl.value;
 
-            const newItem = { mrnNum, reqDate, vehicleMachinery, itemName, itemDesc, reqQty, category };
+            const newItem = { mrnNum, reqDate, vehicleMachinery, itemName, itemDesc, reqQty, category, requestSource };
 
             await syncService.enqueue(
                 'CREATE_ITEM',
@@ -5623,6 +5657,7 @@
                         itemDesc,
                         reqQty,
                         category: category || '',
+                        requestSource,
                         recQty: 0,
                         recDate: null,
                         purchaseSource: '',
@@ -5656,7 +5691,11 @@
             const type = document.querySelector('input[name="recDeskTransactionType"]:checked').value;
             
             const checkedSourceEl = document.querySelector('input[name="recDeskPurchaseSource"]:checked');
-            const source = checkedSourceEl ? checkedSourceEl.value : 'Direct Purchase';
+            if (!checkedSourceEl) {
+                alert('Please select the purchase / supply source (Local Purchase or Head Office Purchase).');
+                return;
+            }
+            const source = checkedSourceEl.value;
 
             const qty = type === 'Return' ? -Math.abs(rawQty) : Math.abs(rawQty);
 

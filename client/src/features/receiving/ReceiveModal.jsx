@@ -4,6 +4,8 @@ import { api } from '../../api/client.js';
 import Modal from '../../components/ui/Modal.jsx';
 import { useToast } from '../../components/ui/Toast.jsx';
 import { num } from '../../lib/format.js';
+import SourceTicks from '../../components/ui/SourceTicks.jsx';
+import { sourceShort } from '../../lib/constants.js';
 
 const today = () => new Date().toISOString().slice(0, 10);
 
@@ -20,7 +22,7 @@ export default function ReceiveModal({ open, onClose, item }) {
         qty: outstanding || '',
         deliveryDate: today(),
         supplierName: '',
-        purchaseSource: '',
+        purchaseSource: item.requestSource || '',
         grnNumber: '',
         invoiceNumber: '',
         invoiceDate: '',
@@ -43,6 +45,7 @@ export default function ReceiveModal({ open, onClose, item }) {
       qc.invalidateQueries({ queryKey: ['items'] });
       qc.invalidateQueries({ queryKey: ['sidebar-stats'] });
       qc.invalidateQueries({ queryKey: ['dashboard-summary'] });
+      qc.invalidateQueries({ queryKey: ['dashboard-purchases'] });
       toast.success('Delivery recorded.');
       onClose();
     },
@@ -64,7 +67,7 @@ export default function ReceiveModal({ open, onClose, item }) {
           </button>
           <button
             onClick={() => save.mutate()}
-            disabled={!Number(f.qty) || save.isPending}
+            disabled={!Number(f.qty) || !f.purchaseSource || save.isPending}
             className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
           >
             {save.isPending ? 'Saving…' : 'Record delivery'}
@@ -90,8 +93,17 @@ export default function ReceiveModal({ open, onClose, item }) {
         <Field label="Supplier">
           <input className="input" value={f.supplierName} onChange={set('supplierName')} placeholder="Supplier name" />
         </Field>
-        <Field label="Purchase source">
-          <input className="input" value={f.purchaseSource} onChange={set('purchaseSource')} placeholder="e.g. Local purchase / Stores" />
+        <Field label="Received from *">
+          <SourceTicks
+            name="receivePurchaseSource"
+            value={f.purchaseSource}
+            onChange={(v) => setF((p) => ({ ...p, purchaseSource: v }))}
+          />
+          {item.requestSource && f.purchaseSource && f.purchaseSource !== item.requestSource && (
+            <span className="mt-1 inline-block rounded bg-amber-50 px-2 py-1 text-xs font-medium text-amber-700">
+              Requested from {sourceShort(item.requestSource)} — receiving as {sourceShort(f.purchaseSource)}
+            </span>
+          )}
         </Field>
         <Field label="GRN number">
           <input className="input" value={f.grnNumber} onChange={set('grnNumber')} />

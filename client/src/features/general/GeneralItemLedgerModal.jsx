@@ -36,11 +36,12 @@ export default function GeneralItemLedgerModal({ open, onClose, itemId, name }) 
                   <th className="px-2 py-2 text-right">Qty</th>
                   <th className="px-2 py-2 text-right">Balance</th>
                   <th className="px-2 py-2">Ref / vehicle</th>
+                  <th className="px-2 py-2">Issued to / by</th>
                   <th className="px-2 py-2">Remarks</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {txns.length === 0 && <tr><td colSpan={6} className="px-2 py-3 text-center text-slate-400">No transactions.</td></tr>}
+                {txns.length === 0 && <tr><td colSpan={7} className="px-2 py-3 text-center text-slate-400">No transactions.</td></tr>}
                 {txns.map((t) => (
                   <tr key={t.id}>
                     <td className="whitespace-nowrap px-2 py-1.5 text-slate-600">{fmtDate(t.txDateISO || t.txDate)}</td>
@@ -48,6 +49,7 @@ export default function GeneralItemLedgerModal({ open, onClose, itemId, name }) 
                     <td className="px-2 py-1.5 text-right tabular-nums">{num(t.qty)}</td>
                     <td className="px-2 py-1.5 text-right font-semibold tabular-nums">{num(t.balance)}</td>
                     <td className="px-2 py-1.5 text-slate-500">{t.transferredToRack || t.vehicleMachinery || t.grnNum || t.mrnNum || '—'}</td>
+                    <td className="px-2 py-1.5 text-slate-500">{[t.issuedTo, t.issuedBy].filter(Boolean).join(' / ') || '—'}</td>
                     <td className="px-2 py-1.5 text-slate-400">{t.remarks || '—'}</td>
                   </tr>
                 ))}

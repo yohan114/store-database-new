@@ -16,7 +16,7 @@ const XLSX = require('xlsx');
 const { PDFParse } = require('pdf-parse');
 
 const dbApi = require('./db');
-const { toISO, nowISO } = dbApi;
+const { toISO, nowISO, SOURCE_LOCAL, SOURCE_HEAD_OFFICE, PURCHASE_SOURCES, canonicalSource } = dbApi;
 const { classify, CATEGORIES } = require('./categorize');
 const auth = require('./auth');
 
@@ -59,6 +59,20 @@ app.get('/legacy', (req, res) => res.redirect('/item_tracker.html'));
 const s = (v) => (v === null || v === undefined) ? '' : String(v);
 const numOrNull = (v) => (v === null || v === undefined || v === '' || isNaN(Number(v))) ? null : Number(v);
 
+// Purchase/supply sources are a closed set (see db.js). Old spellings from the
+// legacy UI ("Local Store", "Direct Purchase", ...) are accepted and stored
+// canonically; anything else is rejected so the data cannot fragment again.
+// Returns { value } on success or { error } for a 400 response.
+function resolveSource(raw, { required = false } = {}) {
+    const v = String(raw == null ? '' : raw).trim();
+    if (!v) return required
+        ? { error: `Purchase source is required — use "${SOURCE_LOCAL}" or "${SOURCE_HEAD_OFFICE}".` }
+        : { value: '' };
+    const canon = canonicalSource(v);
+    if (!canon) return { error: `Invalid purchase source "${v}" — use "${SOURCE_LOCAL}" or "${SOURCE_HEAD_OFFICE}".` };
+    return { value: canon };
+}
+
 // Whitelisted sort columns (prevents SQL injection via the sort param).
 const ITEM_SORTS = {
     mrnNum: 'mrnNum COLLATE NOCASE',
@@ -81,6 +95,10 @@ function buildItemWhere(q) {
         params.push(like, like, like, like, like, like, like, like);
     }
     if (q.category && q.category !== 'all') { where.push(`i.category = ?`); params.push(q.category); }
+    if (q.requestSource && q.requestSource !== 'all') {
+        where.push(`i.requestSource = ?`);
+        params.push(canonicalSource(q.requestSource) || q.requestSource);
+    }
     if (q.vehicle && q.vehicle !== 'all') { where.push(`LOWER(TRIM(i.vehicleMachinery)) = LOWER(TRIM(?))`); params.push(q.vehicle); }
     const startISO = q.startDate ? toISO(q.startDate) : '';
     const endISO = q.endDate ? toISO(q.endDate) : '';
@@ -165,11 +183,13 @@ app.post('/api/items', (req, res) => {
         const itemName = s(b.itemName);
         const itemDesc = s(b.itemDesc);
         const category = b.category && String(b.category).trim() ? String(b.category).trim() : classify(itemName, itemDesc);
+        const src = resolveSource(b.requestSource);
+        if (src.error) return res.status(400).json({ error: src.error });
         const now = nowISO();
         const r = dbApi.run(
-            `INSERT INTO items (mrnNum, reqDate, reqDateISO, vehicleMachinery, itemName, itemDesc, reqQty, category, createdAt, updatedAt)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [s(b.mrnNum), s(b.reqDate), toISO(b.reqDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.reqQty) || 0, category, now, now]
+            `INSERT INTO items (mrnNum, reqDate, reqDateISO, vehicleMachinery, itemName, itemDesc, reqQty, category, requestSource, createdAt, updatedAt)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [s(b.mrnNum), s(b.reqDate), toISO(b.reqDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.reqQty) || 0, category, src.value || null, now, now]
         );
         res.json({ success: true, id: r.lastInsertRowid, category });
     } catch (e) {
@@ -187,9 +207,19 @@ app.put('/api/items/:id', (req, res) => {
         const itemName = s(b.itemName);
         const itemDesc = s(b.itemDesc);
         const category = b.category && String(b.category).trim() ? String(b.category).trim() : classify(itemName, itemDesc);
+        // Only touch requestSource when the client sent it (legacy edit forms don't).
+        let srcValue = null;
+        if (Object.prototype.hasOwnProperty.call(b, 'requestSource')) {
+            const src = resolveSource(b.requestSource);
+            if (src.error) return res.status(400).json({ error: src.error });
+            srcValue = src.value || null;
+        }
         dbApi.run(
-            `UPDATE items SET mrnNum=?, reqDate=?, reqDateISO=?, vehicleMachinery=?, itemName=?, itemDesc=?, reqQty=?, category=?, updatedAt=? WHERE id=?`,
-            [s(b.mrnNum), s(b.reqDate), toISO(b.reqDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.reqQty) || 0, category, nowISO(), id]
+            `UPDATE items SET mrnNum=?, reqDate=?, reqDateISO=?, vehicleMachinery=?, itemName=?, itemDesc=?, reqQty=?, category=?,
+                    requestSource=${Object.prototype.hasOwnProperty.call(b, 'requestSource') ? '?' : 'requestSource'}, updatedAt=? WHERE id=?`,
+            Object.prototype.hasOwnProperty.call(b, 'requestSource')
+                ? [s(b.mrnNum), s(b.reqDate), toISO(b.reqDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.reqQty) || 0, category, srcValue, nowISO(), id]
+                : [s(b.mrnNum), s(b.reqDate), toISO(b.reqDate), s(b.vehicleMachinery), itemName, itemDesc, Number(b.reqQty) || 0, category, nowISO(), id]
         );
         res.json({ success: true, category });
     } catch (e) {
@@ -222,10 +252,16 @@ app.post('/api/items/:id/receipts', (req, res) => {
     try {
         const itemId = parseInt(req.params.id);
         const b = req.body || {};
+        const item = dbApi.get(`SELECT id FROM items WHERE id=?`, [itemId]);
+        if (!item) return res.status(404).json({ error: `No request line with id ${itemId} — cannot log a delivery against it.` });
+        const txType = s(b.transactionType) || 'Receive';
+        // A delivery must confirm which channel it was received from.
+        const src = resolveSource(b.purchaseSource, { required: txType === 'Receive' });
+        if (src.error) return res.status(400).json({ error: src.error });
         const r = dbApi.run(
             `INSERT INTO receipts (itemId, qty, transactionType, deliveryDate, deliveryDateISO, purchaseSource, grnNumber, invoiceNumber, invoiceDate, supplierName, unitPrice)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [itemId, Number(b.qty) || 0, s(b.transactionType), s(b.deliveryDate), toISO(b.deliveryDate), s(b.purchaseSource),
+            [itemId, Number(b.qty) || 0, txType, s(b.deliveryDate), toISO(b.deliveryDate), src.value,
              s(b.grnNumber), s(b.invoiceNumber), s(b.invoiceDate), s(b.supplierName), numOrNull(b.unitPrice)]
         );
         res.json({ success: true, id: r.lastInsertRowid });
@@ -250,7 +286,11 @@ app.put('/api/receipts/:id', (req, res) => {
         if (Object.prototype.hasOwnProperty.call(b, 'deliveryDate')) {
             fields.push('deliveryDate=?', 'deliveryDateISO=?'); params.push(s(b.deliveryDate), toISO(b.deliveryDate));
         }
-        setIf('purchaseSource', 'purchaseSource');
+        if (Object.prototype.hasOwnProperty.call(b, 'purchaseSource')) {
+            const src = resolveSource(b.purchaseSource);
+            if (src.error) return res.status(400).json({ error: src.error });
+            fields.push('purchaseSource=?'); params.push(src.value);
+        }
         setIf('grnNumber', 'grnNumber');
         setIf('invoiceNumber', 'invoiceNumber');
         setIf('invoiceDate', 'invoiceDate');
@@ -1122,6 +1162,101 @@ app.get('/api/dashboard/charts', (req, res) => {
     }
 });
 
+// ===========================================================================
+// GET /api/dashboard/purchases — one round-trip for the dashboard's purchases
+// section: today's spend per source, this month so far, a 12-month breakdown,
+// and the open (pending-delivery) request lines bucketed by request source.
+// Money totals only include priced receipts; the unpriced counts are returned
+// alongside so the UI can say "N deliveries not yet priced" instead of
+// silently under-reporting.
+// ===========================================================================
+app.get('/api/dashboard/purchases', (req, res) => {
+    try {
+        const today = new Date().toISOString().slice(0, 10);
+        const thisMonth = today.slice(0, 7);
+
+        const bySource = (rows) => {
+            const out = { local: 0, headOffice: 0, other: 0, unpricedCount: 0 };
+            for (const r of rows) {
+                if (r.src === SOURCE_LOCAL) out.local = r.total;
+                else if (r.src === SOURCE_HEAD_OFFICE) out.headOffice = r.total;
+                else out.other += r.total;
+                out.unpricedCount += r.unpriced;
+            }
+            return out;
+        };
+        const sourceTotals = (whereISO, params) => bySource(dbApi.all(`
+            SELECT purchaseSource AS src,
+                   COALESCE(SUM(CASE WHEN unitPrice > 0 THEN qty * unitPrice END), 0) AS total,
+                   SUM(CASE WHEN unitPrice IS NULL OR unitPrice = 0 THEN 1 ELSE 0 END) AS unpriced
+            FROM receipts
+            WHERE qty > 0 AND transactionType != 'Return' AND ${whereISO}
+            GROUP BY purchaseSource`, params));
+
+        const todayTotals = sourceTotals(`deliveryDateISO = ?`, [today]);
+        const monthToDate = sourceTotals(`deliveryDateISO LIKE ?`, [thisMonth + '%']);
+
+        // Last 12 calendar months, oldest first (months with no receipts included).
+        const monthlyRaw = dbApi.all(`
+            SELECT SUBSTR(deliveryDateISO, 1, 7) AS month,
+                   purchaseSource AS src,
+                   COALESCE(SUM(CASE WHEN unitPrice > 0 THEN qty * unitPrice END), 0) AS total,
+                   SUM(CASE WHEN unitPrice IS NULL OR unitPrice = 0 THEN 1 ELSE 0 END) AS unpriced
+            FROM receipts
+            WHERE qty > 0 AND transactionType != 'Return'
+              AND deliveryDateISO >= ? AND TRIM(COALESCE(deliveryDateISO,'')) != ''
+            GROUP BY month, purchaseSource
+            ORDER BY month ASC`,
+            [new Date(new Date().setMonth(new Date().getMonth() - 11)).toISOString().slice(0, 7) + '-01']);
+        const monthMap = {};
+        const d = new Date();
+        d.setDate(1);
+        d.setMonth(d.getMonth() - 11);
+        for (let i = 0; i < 12; i++) {
+            const key = d.toISOString().slice(0, 7);
+            monthMap[key] = { month: key, local: 0, headOffice: 0, other: 0, total: 0, unpricedCount: 0 };
+            d.setMonth(d.getMonth() + 1);
+        }
+        for (const r of monthlyRaw) {
+            const m = monthMap[r.month];
+            if (!m) continue;
+            if (r.src === SOURCE_LOCAL) m.local += r.total;
+            else if (r.src === SOURCE_HEAD_OFFICE) m.headOffice += r.total;
+            else m.other += r.total;
+            m.total += r.total;
+            m.unpricedCount += r.unpriced;
+        }
+
+        // Open request lines (still short of the requested qty), bucketed by the
+        // channel the request was assigned to. Oldest first so long-overdue lines surface.
+        const pendingRows = dbApi.all(`
+            SELECT i.id, i.mrnNum, i.reqDate, i.reqDateISO, i.itemName, i.vehicleMachinery, i.category,
+                   i.requestSource, i.reqQty,
+                   COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0) AS recQty,
+                   CASE WHEN i.reqDateISO != '' THEN CAST(julianday(?) - julianday(i.reqDateISO) AS INTEGER) ELSE NULL END AS ageDays
+            FROM items i
+            WHERE i.reqQty > COALESCE((SELECT SUM(qty) FROM receipts r WHERE r.itemId = i.id), 0)
+            ORDER BY CASE WHEN i.reqDateISO = '' THEN 1 ELSE 0 END, i.reqDateISO ASC, i.id ASC`, [today]);
+        const pending = { local: [], headOffice: [], unassigned: [] };
+        for (const r of pendingRows) {
+            r.outstanding = Math.round((r.reqQty - r.recQty) * 100) / 100;
+            if (r.requestSource === SOURCE_LOCAL) pending.local.push(r);
+            else if (r.requestSource === SOURCE_HEAD_OFFICE) pending.headOffice.push(r);
+            else pending.unassigned.push(r);
+        }
+
+        res.json({
+            sources: { local: SOURCE_LOCAL, headOffice: SOURCE_HEAD_OFFICE },
+            today: todayTotals,
+            monthToDate,
+            monthly: Object.values(monthMap),
+            pending,
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.get('/api/dashboard/inflow', (req, res) => {
     try {
         const rows = dbApi.all(`
@@ -1168,12 +1303,12 @@ app.get('/api/dashboard/inflow', (req, res) => {
                 dailyData[date].unpricedCount++;
             }
 
-            const src = (r.purchaseSource || '').trim().toLowerCase();
+            const src = canonicalSource(r.purchaseSource);
             let category = 'other';
-            if (src === 'direct purchase' || src === 'head office' || src === 'pre-ordered') {
+            if (src === SOURCE_HEAD_OFFICE) {
                 category = 'headOffice';
                 dailyData[date].hoValue += cost;
-            } else if (src === 'local store' || src === 'local purchase') {
+            } else if (src === SOURCE_LOCAL) {
                 category = 'localPurchase';
                 dailyData[date].lpValue += cost;
             } else {
@@ -1830,15 +1965,20 @@ app.post('/api/general-items/transaction', (req, res) => {
                 newBalance += qty;
             } else if (txType === 'Issue' || txType === 'Transfer') {
                 newBalance -= qty;
+                // Stock can't go negative: an issue/transfer larger than the rack's
+                // balance is a data-entry error, not a valid movement.
+                if (newBalance < -1e-9) {
+                    throw new Error(`Only ${currentBalance} ${item.unit || ''} in stock at rack ${item.rackNumber || '—'} — cannot ${txType.toLowerCase()} ${qty}.`.replace(/\s+/g, ' '));
+                }
             } else {
                 throw new Error('Invalid transaction type');
             }
-            
+
             // Insert primary transaction
             const r = dbApi.run(`
-                INSERT INTO general_item_transactions (itemId, txDate, txDateISO, txType, mrnNum, grnNum, vehicleMachinery, qty, balance, remarks, transferredToRack, createdAt, updatedAt)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, [itemId, txDate, toISO(txDate), txType, s(b.mrnNum), s(b.grnNum), s(b.vehicleMachinery), qty, newBalance, s(b.remarks), s(b.transferredToRack), now, now]);
+                INSERT INTO general_item_transactions (itemId, txDate, txDateISO, txType, mrnNum, grnNum, vehicleMachinery, qty, balance, remarks, transferredToRack, issuedTo, issuedBy, createdAt, updatedAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, [itemId, txDate, toISO(txDate), txType, s(b.mrnNum), s(b.grnNum), s(b.vehicleMachinery), qty, newBalance, s(b.remarks), s(b.transferredToRack), s(b.issuedTo), s(b.issuedBy), now, now]);
             
             const newTxId = r.lastInsertRowid;
             
@@ -1937,7 +2077,7 @@ app.get('/api/export/excel', (req, res) => {
         const wb = XLSX.utils.book_new();
         const itemsSheet = [[
             'MRN Number', 'Request Date', 'Category', 'Vehicle/Machinery', 'Item Name', 'Item Description',
-            'Requested Qty', 'Received Qty', 'Receive Date', 'Purchase Source', 'Qty Gap', 'Status',
+            'Request Source', 'Requested Qty', 'Received Qty', 'Receive Date', 'Purchase Source', 'Qty Gap', 'Status',
             'GRN Number', 'Invoice Number', 'Invoice Date', 'Supplier Name', 'Unit Price (Rs.)', 'Total Price (Rs.)'
         ]];
 
@@ -1980,7 +2120,7 @@ app.get('/api/export/excel', (req, res) => {
             if (recQty > 0) (priced.length ? pricedCount++ : unpricedCount++);
 
             itemsSheet.push([item.mrnNum || '', item.reqDate || '', item.category || 'General Items', item.vehicleMachinery || '',
-                item.itemName || '', item.itemDesc || '', item.reqQty || 0, recQty, recDate, uniqueSources, qtyGap, status,
+                item.itemName || '', item.itemDesc || '', item.requestSource || '', item.reqQty || 0, recQty, recDate, uniqueSources, qtyGap, status,
                 grns, invoices, invoiceDates, suppliers, totalUnitPrice, totalPrice || '']);
         }
         XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(itemsSheet), 'Requests & Deliveries');
