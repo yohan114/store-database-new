@@ -1172,7 +1172,12 @@ app.get('/api/dashboard/charts', (req, res) => {
 // ===========================================================================
 app.get('/api/dashboard/purchases', (req, res) => {
     try {
-        const today = new Date().toISOString().slice(0, 10);
+        // Local dates, not toISOString(): delivery dates are entered as local
+        // calendar days, and UTC would shift early-morning requests a day back.
+        const pad2 = (n) => String(n).padStart(2, '0');
+        const localYMD = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+        const localYM = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
+        const today = localYMD(new Date());
         const thisMonth = today.slice(0, 7);
 
         const bySource = (rows) => {
@@ -1207,13 +1212,13 @@ app.get('/api/dashboard/purchases', (req, res) => {
               AND deliveryDateISO >= ? AND TRIM(COALESCE(deliveryDateISO,'')) != ''
             GROUP BY month, purchaseSource
             ORDER BY month ASC`,
-            [new Date(new Date().setMonth(new Date().getMonth() - 11)).toISOString().slice(0, 7) + '-01']);
+            [(() => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - 11); return localYM(d) + '-01'; })()]);
         const monthMap = {};
         const d = new Date();
         d.setDate(1);
         d.setMonth(d.getMonth() - 11);
         for (let i = 0; i < 12; i++) {
-            const key = d.toISOString().slice(0, 7);
+            const key = localYM(d);
             monthMap[key] = { month: key, local: 0, headOffice: 0, other: 0, total: 0, unpricedCount: 0 };
             d.setMonth(d.getMonth() + 1);
         }
